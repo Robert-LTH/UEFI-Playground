@@ -5,9 +5,9 @@
 
 #define QR_VERSION                    COMPUTER_INFO_QR_VERSION
 #define QR_SIZE_PIXELS                COMPUTER_INFO_QR_SIZE
-#define QR_DATA_CODEWORDS             34
-#define QR_ECC_CODEWORDS              10
-#define QR_TOTAL_CODEWORDS            44
+#define QR_DATA_CODEWORDS             108
+#define QR_ECC_CODEWORDS              26
+#define QR_TOTAL_CODEWORDS            134
 #define QR_REMAINDER_BITS             7
 #define QR_DATA_BIT_CAPACITY          (QR_DATA_CODEWORDS * 8)
 
