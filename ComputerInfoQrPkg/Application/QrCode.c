@@ -528,14 +528,16 @@ ScoreRunPenalty(
       RunLength++;
     } else {
       if (RunLength >= 5) {
-        Penalty += 3 + (RunLength - 5);
+        INT32 Excess = (INT32)(RunLength - 5);
+        Penalty += 3 + Excess;
       }
       RunLength = 1;
     }
   }
 
   if (RunLength >= 5) {
-    Penalty += 3 + (RunLength - 5);
+    INT32 Excess = (INT32)(RunLength - 5);
+    Penalty += 3 + Excess;
   }
 
   return Penalty;
@@ -610,7 +612,7 @@ EvaluatePenalty(
   UINTN TotalModules = QR_SIZE_PIXELS * QR_SIZE_PIXELS;
   INTN Percent = (INTN)((DarkCount * 100 + TotalModules / 2) / TotalModules);
   INTN FivePercent = ABS(Percent - 50) / 5;
-  Penalty += FivePercent * 10;
+  Penalty += (INT32)FivePercent * 10;
 
   return Penalty;
 }
