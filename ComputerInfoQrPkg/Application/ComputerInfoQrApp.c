@@ -7,6 +7,8 @@
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
 
+#include <Protocol/SimpleTextIn.h>
+
 #include "QrCode.h"
 
 #define QUIET_ZONE_SIZE             2
@@ -164,6 +166,119 @@ RenderQrCode(
   }
 }
 
+STATIC
+EFI_STATUS
+WaitForKeyPress(
+  OUT EFI_INPUT_KEY *Key OPTIONAL
+  )
+{
+  if ((gST == NULL) || (gST->ConIn == NULL)) {
+    return EFI_UNSUPPORTED;
+  }
+
+  EFI_STATUS    Status;
+  UINTN         EventIndex;
+  EFI_INPUT_KEY LocalKey;
+
+  while (TRUE) {
+    Status = gBS->WaitForEvent(1, &gST->ConIn->WaitForKey, &EventIndex);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+
+    Status = gST->ConIn->ReadKeyStroke(gST->ConIn, &LocalKey);
+    if (!EFI_ERROR(Status)) {
+      if (Key != NULL) {
+        *Key = LocalKey;
+      }
+
+      return EFI_SUCCESS;
+    }
+
+    if (Status != EFI_NOT_READY) {
+      return Status;
+    }
+  }
+}
+
+STATIC
+VOID
+ShowQrScreen(
+  IN CONST COMPUTER_INFO_QR_CODE *QrCode,
+  IN CONST CHAR8                 *InfoBuffer
+  )
+{
+  if (gST->ConOut != NULL) {
+    gST->ConOut->ClearScreen(gST->ConOut);
+  }
+
+  Print(L"Computer information encoded as QR code:\n\n");
+  RenderQrCode(QrCode);
+  Print(L"\nRaw data: %a\n", InfoBuffer);
+}
+
+STATIC
+EFI_STATUS
+ShowMenu(
+  IN CONST COMPUTER_INFO_QR_CODE *QrCode,
+  IN CONST CHAR8                 *InfoBuffer
+  )
+{
+  if ((gST == NULL) || (gST->ConOut == NULL)) {
+    return EFI_UNSUPPORTED;
+  }
+
+  EFI_STATUS    Status;
+  EFI_INPUT_KEY Selection;
+
+  while (TRUE) {
+    gST->ConOut->ClearScreen(gST->ConOut);
+
+    Print(L"Computer Information Menu\n\n");
+    Print(L"Encoded data: %a\n\n", InfoBuffer);
+    Print(L"Options:\n");
+    Print(L"  [1] Display the QR code\n");
+    Print(L"  [Q] Quit\n\n");
+    Print(L"Select an option: ");
+
+    Status = WaitForKeyPress(&Selection);
+    if (EFI_ERROR(Status)) {
+      Print(L"\nFailed to read input: %r\n", Status);
+      return Status;
+    }
+
+    Print(L"\n");
+
+    if (Selection.UnicodeChar == L'1') {
+      ShowQrScreen(QrCode, InfoBuffer);
+      Print(L"\nPress any key to return to the menu...\n");
+      Status = WaitForKeyPress(NULL);
+      if (EFI_ERROR(Status)) {
+        Print(L"Failed to read input: %r\n", Status);
+        return Status;
+      }
+
+      continue;
+    }
+
+    if ((Selection.UnicodeChar == L'Q') || (Selection.UnicodeChar == L'q') || (Selection.ScanCode == SCAN_ESC)) {
+      Print(L"Exiting application...\n");
+      break;
+    }
+
+    Print(L"Unrecognized selection.\n");
+    Print(L"Press any key to try again...\n");
+
+    Status = WaitForKeyPress(NULL);
+    if (EFI_ERROR(Status)) {
+      Print(L"Failed to read input: %r\n", Status);
+      return Status;
+    }
+  }
+
+  return EFI_SUCCESS;
+}
+
 EFI_STATUS
 EFIAPI
 UefiMain(
@@ -217,13 +332,19 @@ UefiMain(
     return Status;
   }
 
-  if (gST->ConOut != NULL) {
-    gST->ConOut->ClearScreen(gST->ConOut);
+  ShowQrScreen(&QrCode, InfoBuffer);
+
+  Print(L"\nPress any key to continue...\n");
+  Status = WaitForKeyPress(NULL);
+  if (EFI_ERROR(Status)) {
+    Print(L"Failed to read input: %r\n", Status);
+    return Status;
   }
 
-  Print(L"Computer information encoded as QR code:\n\n");
-  RenderQrCode(&QrCode);
-  Print(L"\nRaw data: %a\n", InfoBuffer);
+  Status = ShowMenu(&QrCode, InfoBuffer);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
 
   return EFI_SUCCESS;
 }
