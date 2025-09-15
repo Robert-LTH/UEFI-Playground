@@ -1,0 +1,23 @@
+[Defines]
+  INF_VERSION                    = 0x00010017
+  BASE_NAME                      = ComputerInfoQrApp
+  FILE_GUID                      = 14d5b6f9-4539-40a8-9b41-cd19f732a59f
+  MODULE_TYPE                    = UEFI_APPLICATION
+  VERSION_STRING                 = 0.1
+  ENTRY_POINT                    = UefiMain
+
+[Sources]
+  ComputerInfoQrApp.c
+  QrCode.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ComputerInfoQrPkg/ComputerInfoQrPkg.dec
+
+[LibraryClasses]
+  UefiApplicationEntryPoint
+  UefiLib
+  PrintLib
+  BaseLib
+  BaseMemoryLib
+  MemoryAllocationLib

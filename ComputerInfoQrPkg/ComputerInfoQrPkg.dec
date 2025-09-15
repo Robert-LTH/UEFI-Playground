@@ -1,0 +1,8 @@
+[Defines]
+  DEC_SPECIFICATION = 0x00010005
+  PACKAGE_NAME      = ComputerInfoQrPkg
+  PACKAGE_GUID      = 06b2ac78-52a0-4d7a-b513-b41726b0d830
+  PACKAGE_VERSION   = 0.1
+
+[Includes]
+  Include
