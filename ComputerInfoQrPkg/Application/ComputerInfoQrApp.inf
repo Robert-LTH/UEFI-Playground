@@ -8,6 +8,7 @@
 
 [Sources]
   ComputerInfoQrApp.c
+  CrtShim.c
   QrCode.c
 
 [Packages]
@@ -17,7 +18,16 @@
 [LibraryClasses]
   UefiApplicationEntryPoint
   UefiLib
+  DevicePathLib
   PrintLib
   BaseLib
   BaseMemoryLib
   MemoryAllocationLib
+  StackCheckLib
+  StackCheckFailureHookLib
+  DebugLib
+  UefiBootServicesTableLib
+  UefiRuntimeServicesTableLib
+  DebugPrintErrorLevelLib
+  RegisterFilterLib
+  PcdLib
