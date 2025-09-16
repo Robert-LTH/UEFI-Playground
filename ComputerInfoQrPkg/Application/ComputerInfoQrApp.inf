@@ -31,3 +31,8 @@
   DebugPrintErrorLevelLib
   RegisterFilterLib
   PcdLib
+
+[Protocols]
+  gEfiGraphicsOutputProtocolGuid
+  gEfiSimpleNetworkProtocolGuid
+  gEfiSmbiosProtocolGuid

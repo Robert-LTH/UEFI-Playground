@@ -479,39 +479,39 @@ DrawFormatBits(
 {
   UINT16 Format = CalculateFormatBits(Mask);
 
-  for (INTN Index = 0; Index <= 5; Index++) {
+  CONST INTN HorizontalPositions[8] = { 0, 1, 2, 3, 4, 5, 7, 8 };
+  CONST INTN VerticalPositions[8]   = { 0, 1, 2, 3, 4, 5, 7, 8 };
+
+  for (INTN Index = 0; Index < 8; Index++) {
     UINT8 Bit = (UINT8)((Format >> Index) & 0x1);
-    Modules[8][Index] = (INT8)Bit;
-    FunctionModules[8][Index] = TRUE;
+    INTN  Row = VerticalPositions[Index];
+    Modules[Row][8] = (INT8)Bit;
+    FunctionModules[Row][8] = TRUE;
   }
 
-  Modules[8][7] = (INT8)((Format >> 6) & 0x1);
-  FunctionModules[8][7] = TRUE;
-  Modules[8][8] = (INT8)((Format >> 7) & 0x1);
-  FunctionModules[8][8] = TRUE;
-  Modules[7][8] = (INT8)((Format >> 8) & 0x1);
-  FunctionModules[7][8] = TRUE;
-
-  for (INTN Index = 9; Index < 15; Index++) {
-    UINT8 Bit = (UINT8)((Format >> Index) & 0x1);
-    Modules[14 - Index][8] = (INT8)Bit;
-    FunctionModules[14 - Index][8] = TRUE;
+  for (INTN Index = 0; Index < 8; Index++) {
+    UINT8 Bit = (UINT8)((Format >> (14 - Index)) & 0x1);
+    INTN  Column = HorizontalPositions[Index];
+    Modules[8][Column] = (INT8)Bit;
+    FunctionModules[8][Column] = TRUE;
   }
 
   for (INTN Index = 0; Index < 8; Index++) {
     UINT8 Bit = (UINT8)((Format >> Index) & 0x1);
-    Modules[QR_SIZE_PIXELS - 1 - Index][8] = (INT8)Bit;
-    FunctionModules[QR_SIZE_PIXELS - 1 - Index][8] = TRUE;
+    INTN  Column = (INTN)QR_SIZE_PIXELS - 1 - Index;
+    Modules[8][Column] = (INT8)Bit;
+    FunctionModules[8][Column] = TRUE;
   }
 
-  for (INTN Index = 8; Index < 15; Index++) {
-    UINT8 Bit = (UINT8)((Format >> Index) & 0x1);
-    Modules[8][QR_SIZE_PIXELS - 15 + Index] = (INT8)Bit;
-    FunctionModules[8][QR_SIZE_PIXELS - 15 + Index] = TRUE;
+  for (INTN Index = 0; Index < 8; Index++) {
+    UINT8 Bit = (UINT8)((Format >> (14 - Index)) & 0x1);
+    INTN  Row = (INTN)QR_SIZE_PIXELS - 1 - Index;
+    Modules[Row][8] = (INT8)Bit;
+    FunctionModules[Row][8] = TRUE;
   }
 
-  Modules[8][QR_SIZE_PIXELS - 8] = 1;
-  FunctionModules[8][QR_SIZE_PIXELS - 8] = TRUE;
+  Modules[QR_SIZE_PIXELS - 8][8] = 1;
+  FunctionModules[QR_SIZE_PIXELS - 8][8] = TRUE;
 }
 
 STATIC
