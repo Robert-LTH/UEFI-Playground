@@ -597,7 +597,7 @@ PostSystemInfoToServer(
   BOOLEAN    Completed = FALSE;
 
   for (UINTN Index = 0; Index < HandleCount; Index++) {
-    EFI_HTTP_SERVICE_BINDING_PROTOCOL *ServiceBinding = NULL;
+    EFI_SERVICE_BINDING_PROTOCOL      *ServiceBinding = NULL;
     EFI_HANDLE                         ChildHandle    = NULL;
     EFI_HTTP_PROTOCOL                 *Http           = NULL;
     BOOLEAN                            ChildCreated   = FALSE;
