@@ -8,6 +8,7 @@
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/UefiLib.h>
 
+#include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleNetwork.h>
 #include <Protocol/SimpleTextIn.h>
 #include <Protocol/Smbios.h>
@@ -411,6 +412,119 @@ RenderQrCode(
 }
 
 STATIC
+BOOLEAN
+RenderQrToFramebuffer(
+  IN CONST COMPUTER_INFO_QR_CODE *QrCode
+  )
+{
+  if ((QrCode == NULL) || (QrCode->Size == 0)) {
+    return FALSE;
+  }
+
+  if (gBS == NULL) {
+    return FALSE;
+  }
+
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *GraphicsOutput = NULL;
+  EFI_STATUS                    Status;
+
+  Status = gBS->LocateProtocol(
+                  &gEfiGraphicsOutputProtocolGuid,
+                  NULL,
+                  (VOID **)&GraphicsOutput
+                  );
+  if (EFI_ERROR(Status) || (GraphicsOutput == NULL)) {
+    return FALSE;
+  }
+
+  if ((GraphicsOutput->Mode == NULL) || (GraphicsOutput->Mode->Info == NULL)) {
+    return FALSE;
+  }
+
+  CONST EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *ModeInfo = GraphicsOutput->Mode->Info;
+  UINTN                                      HorizontalResolution = ModeInfo->HorizontalResolution;
+  UINTN                                      VerticalResolution   = ModeInfo->VerticalResolution;
+
+  if ((HorizontalResolution == 0) || (VerticalResolution == 0)) {
+    return FALSE;
+  }
+
+  UINTN TotalModules = QrCode->Size + (QUIET_ZONE_SIZE * 2);
+  if (TotalModules == 0) {
+    return FALSE;
+  }
+
+  UINTN ModulePixelSize = HorizontalResolution / TotalModules;
+  UINTN VerticalModuleSize = VerticalResolution / TotalModules;
+  if (VerticalModuleSize < ModulePixelSize) {
+    ModulePixelSize = VerticalModuleSize;
+  }
+
+  if (ModulePixelSize == 0) {
+    return FALSE;
+  }
+
+  UINTN QrPixelSize = ModulePixelSize * TotalModules;
+  UINTN OffsetX = 0;
+  UINTN OffsetY = 0;
+
+  if (HorizontalResolution > QrPixelSize) {
+    OffsetX = (HorizontalResolution - QrPixelSize) / 2;
+  }
+  if (VerticalResolution > QrPixelSize) {
+    OffsetY = (VerticalResolution - QrPixelSize) / 2;
+  }
+
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL White = { 0xFF, 0xFF, 0xFF, 0x00 };
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL Black = { 0x00, 0x00, 0x00, 0x00 };
+
+  Status = GraphicsOutput->Blt(
+                               GraphicsOutput,
+                               &White,
+                               EfiBltVideoFill,
+                               0,
+                               0,
+                               0,
+                               0,
+                               HorizontalResolution,
+                               VerticalResolution,
+                               0
+                               );
+  if (EFI_ERROR(Status)) {
+    return FALSE;
+  }
+
+  for (UINTN Row = 0; Row < QrCode->Size; Row++) {
+    for (UINTN Column = 0; Column < QrCode->Size; Column++) {
+      if (QrCode->Modules[Row][Column] == 0) {
+        continue;
+      }
+
+      UINTN PixelX = OffsetX + (Column + QUIET_ZONE_SIZE) * ModulePixelSize;
+      UINTN PixelY = OffsetY + (Row + QUIET_ZONE_SIZE) * ModulePixelSize;
+
+      Status = GraphicsOutput->Blt(
+                                     GraphicsOutput,
+                                     &Black,
+                                     EfiBltVideoFill,
+                                     0,
+                                     0,
+                                     PixelX,
+                                     PixelY,
+                                     ModulePixelSize,
+                                     ModulePixelSize,
+                                     0
+                                     );
+      if (EFI_ERROR(Status)) {
+        return FALSE;
+      }
+    }
+  }
+
+  return TRUE;
+}
+
+STATIC
 EFI_STATUS
 WaitForKeyPress(
   OUT EFI_INPUT_KEY *Key OPTIONAL
@@ -451,6 +565,10 @@ ShowQrScreen(
   IN CONST COMPUTER_INFO_QR_CODE *QrCode
   )
 {
+  if (RenderQrToFramebuffer(QrCode)) {
+    return;
+  }
+
   if (gST->ConOut != NULL) {
     gST->ConOut->ClearScreen(gST->ConOut);
   }
