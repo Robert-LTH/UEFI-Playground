@@ -31,6 +31,8 @@
 #define DHCP_OPTION_PAD                 0
 #define DHCP_OPTION_END                 255
 #define COMPUTER_INFO_QR_SERVER_URL_OPTION  224
+#define DHCP_OPTION_MAX_LENGTH              255
+#define IPV4_STRING_BUFFER_LENGTH           16
 
 STATIC
 BOOLEAN
@@ -526,6 +528,291 @@ GetServerUrlFromDhcp(
   }
 
   return Result;
+}
+
+STATIC
+CONST CHAR16 *
+Dhcp4StateToString(
+  IN EFI_DHCP4_STATE State
+  )
+{
+  switch (State) {
+    case Dhcp4Stopped:
+      return L"Stopped";
+    case Dhcp4Init:
+      return L"Init";
+    case Dhcp4Selecting:
+      return L"Selecting";
+    case Dhcp4Requesting:
+      return L"Requesting";
+    case Dhcp4Bound:
+      return L"Bound";
+    case Dhcp4Renewing:
+      return L"Renewing";
+    case Dhcp4Rebinding:
+      return L"Rebinding";
+    case Dhcp4InitReboot:
+      return L"Init-Reboot";
+    case Dhcp4Rebooting:
+      return L"Rebooting";
+    default:
+      return L"Unknown";
+  }
+}
+
+STATIC
+VOID
+Ipv4AddressToString(
+  IN  CONST EFI_IPv4_ADDRESS *Address,
+  OUT CHAR16                 *Buffer,
+  IN  UINTN                   BufferSize
+  )
+{
+  if ((Buffer == NULL) || (BufferSize < (IPV4_STRING_BUFFER_LENGTH * sizeof(CHAR16)))) {
+    return;
+  }
+
+  Buffer[0] = L'\0';
+
+  if (Address == NULL) {
+    UnicodeSPrint(Buffer, BufferSize, L"0.0.0.0");
+    return;
+  }
+
+  UnicodeSPrint(
+    Buffer,
+    BufferSize,
+    L"%u.%u.%u.%u",
+    (UINT32)Address->Addr[0],
+    (UINT32)Address->Addr[1],
+    (UINT32)Address->Addr[2],
+    (UINT32)Address->Addr[3]
+    );
+}
+
+STATIC
+VOID
+PrintDhcpOptions(
+  IN CONST EFI_DHCP4_PACKET *Packet
+  )
+{
+  if ((Packet == NULL) || (Packet->Length <= OFFSET_OF(EFI_DHCP4_PACKET, Dhcp4.Option))) {
+    Print(L"    No DHCP options available.\n");
+    return;
+  }
+
+  CONST UINT8 *Option = Packet->Dhcp4.Option;
+  CONST UINT8 *End    = ((CONST UINT8 *)Packet) + Packet->Length;
+  CHAR16       AsciiBuffer[DHCP_OPTION_MAX_LENGTH + 1];
+
+  while (Option < End) {
+    UINT8 OptionCode = *Option++;
+
+    if (OptionCode == DHCP_OPTION_PAD) {
+      Print(L"    Option 0 (Pad)\n");
+      continue;
+    }
+
+    if (OptionCode == DHCP_OPTION_END) {
+      Print(L"    Option 255 (End)\n");
+      break;
+    }
+
+    if (Option >= End) {
+      Print(L"    Malformed DHCP option detected after code %u.\n", (UINT32)OptionCode);
+      break;
+    }
+
+    UINT8 OptionLength = *Option++;
+    if ((Option + OptionLength) > End) {
+      Print(
+        L"    Malformed DHCP option %u length %u exceeds packet boundary.\n",
+        (UINT32)OptionCode,
+        (UINT32)OptionLength
+        );
+      break;
+    }
+
+    Print(L"    Option %u (0x%02X), length %u\n", (UINT32)OptionCode, (UINT32)OptionCode, (UINT32)OptionLength);
+
+    if (OptionLength == 0) {
+      Print(L"      Data: (none)\n");
+    } else {
+      Print(L"      Data:");
+      for (UINTN ByteIndex = 0; ByteIndex < OptionLength; ByteIndex++) {
+        Print(L" %02X", (UINT32)Option[ByteIndex]);
+      }
+      Print(L"\n");
+
+      UINTN CopyLength = OptionLength;
+      if (CopyLength > DHCP_OPTION_MAX_LENGTH) {
+        CopyLength = DHCP_OPTION_MAX_LENGTH;
+      }
+
+      for (UINTN ByteIndex = 0; ByteIndex < CopyLength; ByteIndex++) {
+        CHAR8 Value = (CHAR8)Option[ByteIndex];
+        if ((Value >= 0x20) && (Value <= 0x7E)) {
+          AsciiBuffer[ByteIndex] = (CHAR16)Value;
+        } else {
+          AsciiBuffer[ByteIndex] = L'.';
+        }
+      }
+      AsciiBuffer[CopyLength] = L'\0';
+
+      Print(L"      ASCII: %s\n", AsciiBuffer);
+    }
+
+    Option += OptionLength;
+  }
+}
+
+STATIC
+VOID
+ShowNetworkInformation(
+  VOID
+  )
+{
+  EFI_STATUS Status;
+  EFI_HANDLE *HandleBuffer = NULL;
+  UINTN       HandleCount  = 0;
+
+  Print(L"Collecting networking information...\n\n");
+
+  Status = gBS->LocateHandleBuffer(
+                          ByProtocol,
+                          &gEfiDhcp4ProtocolGuid,
+                          NULL,
+                          &HandleCount,
+                          &HandleBuffer
+                          );
+  if (EFI_ERROR(Status) || (HandleCount == 0) || (HandleBuffer == NULL)) {
+    if (EFI_ERROR(Status)) {
+      Print(L"Unable to locate DHCPv4 handles: %r\n", Status);
+    } else {
+      Print(L"No DHCPv4 interfaces found.\n");
+    }
+    goto Cleanup;
+  }
+
+  for (UINTN Index = 0; Index < HandleCount; Index++) {
+    Print(L"DHCPv4 Interface %u\n", (UINT32)(Index + 1));
+    Print(L"---------------------\n");
+    Print(L"  Handle: %p\n", HandleBuffer[Index]);
+
+    EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
+    Status = gBS->HandleProtocol(
+                    HandleBuffer[Index],
+                    &gEfiDhcp4ProtocolGuid,
+                    (VOID **)&Dhcp4
+                    );
+    if (EFI_ERROR(Status) || (Dhcp4 == NULL)) {
+      Print(L"  Unable to open EFI_DHCP4_PROTOCOL: %r\n\n", Status);
+      continue;
+    }
+
+    EFI_DHCP4_MODE_DATA ModeData;
+    ZeroMem(&ModeData, sizeof(ModeData));
+
+    Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
+    if (EFI_ERROR(Status)) {
+      Print(L"  GetModeData failed: %r\n\n", Status);
+      continue;
+    }
+
+    Print(L"  State: %s (%u)\n", Dhcp4StateToString(ModeData.State), (UINT32)ModeData.State);
+
+    UINTN MacAddressSize = 0;
+    EFI_SIMPLE_NETWORK_PROTOCOL *Snp = NULL;
+    Status = gBS->HandleProtocol(
+                    HandleBuffer[Index],
+                    &gEfiSimpleNetworkProtocolGuid,
+                    (VOID **)&Snp
+                    );
+    if (!EFI_ERROR(Status) && (Snp != NULL) && (Snp->Mode != NULL)) {
+      MacAddressSize = Snp->Mode->HwAddressSize;
+    }
+    if ((MacAddressSize == 0) && (ModeData.ReplyPacket != NULL)) {
+      MacAddressSize = ModeData.ReplyPacket->Dhcp4.Header.HwAddrLen;
+    }
+    if (MacAddressSize > MAC_ADDRESS_MAX_BYTES) {
+      MacAddressSize = MAC_ADDRESS_MAX_BYTES;
+    }
+
+    CHAR8 MacString[MAC_STRING_BUFFER_LENGTH];
+    MacAddressToString(&ModeData.ClientMacAddress, MacAddressSize, MacString, sizeof(MacString));
+    if (MacString[0] == '\0') {
+      AsciiStrCpyS(MacString, sizeof(MacString), UNKNOWN_STRING);
+    }
+    Print(L"  Client MAC: %a\n", MacString);
+
+    CHAR16 AddressString[IPV4_STRING_BUFFER_LENGTH];
+
+    Ipv4AddressToString(&ModeData.ClientAddress, AddressString, sizeof(AddressString));
+    Print(L"  Client IP: %s\n", AddressString);
+
+    Ipv4AddressToString(&ModeData.ServerAddress, AddressString, sizeof(AddressString));
+    Print(L"  DHCP Server: %s\n", AddressString);
+
+    Ipv4AddressToString(&ModeData.RouterAddress, AddressString, sizeof(AddressString));
+    Print(L"  Router: %s\n", AddressString);
+
+    Ipv4AddressToString(&ModeData.SubnetMask, AddressString, sizeof(AddressString));
+    Print(L"  Subnet Mask: %s\n", AddressString);
+
+    if (ModeData.LeaseTime == 0xFFFFFFFF) {
+      Print(L"  Lease Time: Infinite\n");
+    } else {
+      Print(L"  Lease Time: %u seconds\n", (UINT32)ModeData.LeaseTime);
+    }
+
+    if (ModeData.ReplyPacket != NULL) {
+      Print(L"  DHCP Reply Packet Length: %u bytes\n", ModeData.ReplyPacket->Length);
+      Print(L"  DHCP Transaction ID: 0x%08X\n", ModeData.ReplyPacket->Dhcp4.Header.Xid);
+
+      Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.YourAddr, AddressString, sizeof(AddressString));
+      Print(L"  Assigned IP (packet): %s\n", AddressString);
+
+      Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.ServerAddr, AddressString, sizeof(AddressString));
+      Print(L"  Server IP (packet): %s\n", AddressString);
+
+      Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.GatewayAddr, AddressString, sizeof(AddressString));
+      Print(L"  Gateway IP (packet): %s\n", AddressString);
+
+      CHAR8 ServerName[sizeof(ModeData.ReplyPacket->Dhcp4.Header.ServerName) + 1];
+      ZeroMem(ServerName, sizeof(ServerName));
+      CopyMem(
+        ServerName,
+        ModeData.ReplyPacket->Dhcp4.Header.ServerName,
+        sizeof(ModeData.ReplyPacket->Dhcp4.Header.ServerName)
+        );
+      if (ServerName[0] != '\0') {
+        Print(L"  DHCP Server Name: %a\n", ServerName);
+      }
+
+      CHAR8 BootFileName[sizeof(ModeData.ReplyPacket->Dhcp4.Header.BootFileName) + 1];
+      ZeroMem(BootFileName, sizeof(BootFileName));
+      CopyMem(
+        BootFileName,
+        ModeData.ReplyPacket->Dhcp4.Header.BootFileName,
+        sizeof(ModeData.ReplyPacket->Dhcp4.Header.BootFileName)
+        );
+      if (BootFileName[0] != '\0') {
+        Print(L"  Boot File Name: %a\n", BootFileName);
+      }
+
+      Print(L"  DHCP Options:\n");
+      PrintDhcpOptions(ModeData.ReplyPacket);
+    } else {
+      Print(L"  No DHCP reply packet cached for this interface.\n");
+    }
+
+    Print(L"\n");
+  }
+
+Cleanup:
+  if (HandleBuffer != NULL) {
+    FreePool(HandleBuffer);
+  }
 }
 
 STATIC
@@ -1025,6 +1312,7 @@ GetMenuSelection(
     Print(L"============================\n");
     Print(L"1. Display QR code\n");
     Print(L"2. Send system information to server\n");
+    Print(L"3. Display networking information\n");
     Print(L"Q. Quit\n\n");
     Print(L"Select an option: ");
 
@@ -1036,7 +1324,7 @@ GetMenuSelection(
     }
 
     CHAR16 Value = Key.UnicodeChar;
-    if ((Value == L'1') || (Value == L'2') || (Value == L'Q') || (Value == L'q')) {
+    if ((Value == L'1') || (Value == L'2') || (Value == L'3') || (Value == L'Q') || (Value == L'q')) {
       *Selection = Value;
       return EFI_SUCCESS;
     }
@@ -1143,6 +1431,12 @@ UefiMain(
         } else {
           Print(L"\nSystem information successfully sent.\n");
         }
+        Print(L"\nPress any key to return to the menu...\n");
+        WaitForKeyPress(NULL);
+        break;
+
+      case L'3':
+        ShowNetworkInformation();
         Print(L"\nPress any key to return to the menu...\n");
         WaitForKeyPress(NULL);
         break;
