@@ -9,14 +9,18 @@
 #include <Library/UefiLib.h>
 
 #include <Protocol/GraphicsOutput.h>
+#include <Protocol/Dhcp4.h>
+#include <Protocol/Http.h>
 #include <Protocol/SimpleNetwork.h>
 #include <Protocol/SimpleTextIn.h>
+#include <Protocol/ServiceBinding.h>
 #include <Protocol/Smbios.h>
 
 #include "QrCode.h"
 
 #define QUIET_ZONE_SIZE                 2
 #define INFO_BUFFER_LENGTH              (COMPUTER_INFO_QR_MAX_DATA_LENGTH + 1)
+#define JSON_PAYLOAD_BUFFER_LENGTH      512
 #define UUID_STRING_LENGTH              36
 #define UUID_STRING_BUFFER_LENGTH       (UUID_STRING_LENGTH + 1)
 #define MAC_ADDRESS_MAX_BYTES           32
@@ -24,6 +28,9 @@
 #define MAC_STRING_BUFFER_LENGTH        (MAC_STRING_MAX_LENGTH + 1)
 #define SERIAL_NUMBER_BUFFER_LENGTH     (COMPUTER_INFO_QR_MAX_DATA_LENGTH + 1)
 #define UNKNOWN_STRING                  "UNKNOWN"
+#define DHCP_OPTION_PAD                 0
+#define DHCP_OPTION_END                 255
+#define COMPUTER_INFO_QR_SERVER_URL_OPTION  224
 
 STATIC
 BOOLEAN
@@ -341,6 +348,433 @@ MacAddressToString(
 }
 
 STATIC
+EFI_STATUS
+BuildJsonPayload(
+  OUT CHAR8       *JsonBuffer,
+  IN  UINTN        JsonBufferSize,
+  IN  CONST CHAR8 *UuidString,
+  IN  CONST CHAR8 *MacString,
+  IN  CONST CHAR8 *SerialNumber
+  )
+{
+  if ((JsonBuffer == NULL) || (JsonBufferSize == 0) ||
+      (UuidString == NULL) || (MacString == NULL) || (SerialNumber == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  UINTN UuidLength   = AsciiStrLen(UuidString);
+  UINTN MacLength    = AsciiStrLen(MacString);
+  UINTN SerialLength = AsciiStrLen(SerialNumber);
+  UINTN RequiredLength = 39 + UuidLength + MacLength + SerialLength;
+
+  if (RequiredLength >= JsonBufferSize) {
+    return EFI_BUFFER_TOO_SMALL;
+  }
+
+  AsciiSPrint(
+    JsonBuffer,
+    JsonBufferSize,
+    "{\"uuid\":\"%a\",\"mac\":\"%a\",\"serial_number\":\"%a\"}",
+    UuidString,
+    MacString,
+    SerialNumber
+    );
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+ExtractServerUrlFromDhcpPacket(
+  IN  CONST EFI_DHCP4_PACKET *Packet,
+  OUT CHAR16                 **ServerUrl
+  )
+{
+  if ((Packet == NULL) || (ServerUrl == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *ServerUrl = NULL;
+
+  if (Packet->Length <= OFFSET_OF(EFI_DHCP4_PACKET, Dhcp4.Option)) {
+    return EFI_NOT_FOUND;
+  }
+
+  CONST UINT8 *Option = Packet->Dhcp4.Option;
+  CONST UINT8 *End    = ((CONST UINT8 *)Packet) + Packet->Length;
+
+  while (Option < End) {
+    UINT8 OptionCode = *Option++;
+
+    if (OptionCode == DHCP_OPTION_PAD) {
+      continue;
+    }
+
+    if (OptionCode == DHCP_OPTION_END) {
+      break;
+    }
+
+    if (Option >= End) {
+      break;
+    }
+
+    UINT8 OptionLength = *Option++;
+    if ((Option + OptionLength) > End) {
+      break;
+    }
+
+    if (OptionCode == COMPUTER_INFO_QR_SERVER_URL_OPTION) {
+      if (OptionLength == 0) {
+        return EFI_NOT_FOUND;
+      }
+
+      CHAR8 *AsciiUrl = AllocateZeroPool(OptionLength + 1);
+      if (AsciiUrl == NULL) {
+        return EFI_OUT_OF_RESOURCES;
+      }
+
+      CopyMem(AsciiUrl, Option, OptionLength);
+
+      CHAR16 *UnicodeUrl = AllocateZeroPool((OptionLength + 1) * sizeof(CHAR16));
+      if (UnicodeUrl == NULL) {
+        FreePool(AsciiUrl);
+        return EFI_OUT_OF_RESOURCES;
+      }
+
+      EFI_STATUS Status = AsciiStrToUnicodeStrS(AsciiUrl, UnicodeUrl, OptionLength + 1);
+      FreePool(AsciiUrl);
+      if (EFI_ERROR(Status)) {
+        FreePool(UnicodeUrl);
+        return Status;
+      }
+
+      *ServerUrl = UnicodeUrl;
+      return EFI_SUCCESS;
+    }
+
+    Option += OptionLength;
+  }
+
+  return EFI_NOT_FOUND;
+}
+
+STATIC
+EFI_STATUS
+GetServerUrlFromDhcp(
+  OUT CHAR16 **ServerUrl
+  )
+{
+  if (ServerUrl == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *ServerUrl = NULL;
+
+  EFI_HANDLE *HandleBuffer = NULL;
+  UINTN       HandleCount  = 0;
+
+  EFI_STATUS Status = gBS->LocateHandleBuffer(
+                          ByProtocol,
+                          &gEfiDhcp4ProtocolGuid,
+                          NULL,
+                          &HandleCount,
+                          &HandleBuffer
+                          );
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  EFI_STATUS Result = EFI_NOT_FOUND;
+
+  for (UINTN Index = 0; Index < HandleCount; Index++) {
+    EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
+    Status = gBS->HandleProtocol(
+                    HandleBuffer[Index],
+                    &gEfiDhcp4ProtocolGuid,
+                    (VOID **)&Dhcp4
+                    );
+    if (EFI_ERROR(Status) || (Dhcp4 == NULL)) {
+      continue;
+    }
+
+    EFI_DHCP4_MODE_DATA ModeData;
+    ZeroMem(&ModeData, sizeof(ModeData));
+
+    Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
+    if (EFI_ERROR(Status) || (ModeData.ReplyPacket == NULL)) {
+      continue;
+    }
+
+    Status = ExtractServerUrlFromDhcpPacket(ModeData.ReplyPacket, ServerUrl);
+    if (!EFI_ERROR(Status) && (*ServerUrl != NULL)) {
+      Result = EFI_SUCCESS;
+      break;
+    }
+
+    if ((Result == EFI_NOT_FOUND) && (Status != EFI_NOT_FOUND)) {
+      Result = Status;
+    }
+  }
+
+  if (HandleBuffer != NULL) {
+    FreePool(HandleBuffer);
+  }
+
+  if (EFI_ERROR(Result) && (*ServerUrl != NULL)) {
+    FreePool(*ServerUrl);
+    *ServerUrl = NULL;
+  }
+
+  return Result;
+}
+
+STATIC
+VOID
+FreeHttpHeaders(
+  IN EFI_HTTP_HEADER *Headers,
+  IN UINTN            HeaderCount
+  )
+{
+  if ((Headers == NULL) || (HeaderCount == 0)) {
+    return;
+  }
+
+  for (UINTN Index = 0; Index < HeaderCount; Index++) {
+    if (Headers[Index].FieldName != NULL) {
+      FreePool(Headers[Index].FieldName);
+    }
+    if (Headers[Index].FieldValue != NULL) {
+      FreePool(Headers[Index].FieldValue);
+    }
+  }
+
+  FreePool(Headers);
+}
+
+STATIC
+EFI_STATUS
+PostSystemInfoToServer(
+  IN CONST CHAR8 *JsonPayload,
+  IN UINTN        PayloadLength
+  )
+{
+  if ((JsonPayload == NULL) || (PayloadLength == 0)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  CHAR16 *ServerUrl = NULL;
+  EFI_STATUS Status = GetServerUrlFromDhcp(&ServerUrl);
+  if (EFI_ERROR(Status)) {
+    Print(L"Unable to retrieve server URL from DHCP: %r\n", Status);
+    return Status;
+  }
+
+  Print(L"Using server URL: %s\n", ServerUrl);
+
+  EFI_HANDLE *HandleBuffer = NULL;
+  UINTN       HandleCount  = 0;
+
+  Status = gBS->LocateHandleBuffer(
+                  ByProtocol,
+                  &gEfiHttpServiceBindingProtocolGuid,
+                  NULL,
+                  &HandleCount,
+                  &HandleBuffer
+                  );
+  if (EFI_ERROR(Status) || (HandleCount == 0) || (HandleBuffer == NULL)) {
+    if (!EFI_ERROR(Status)) {
+      Status = EFI_NOT_FOUND;
+    }
+    Print(L"Unable to locate HTTP service binding: %r\n", Status);
+    if (HandleBuffer != NULL) {
+      FreePool(HandleBuffer);
+    }
+    FreePool(ServerUrl);
+    return Status;
+  }
+
+  EFI_STATUS Result    = EFI_DEVICE_ERROR;
+  BOOLEAN    Completed = FALSE;
+
+  for (UINTN Index = 0; Index < HandleCount; Index++) {
+    EFI_HTTP_SERVICE_BINDING_PROTOCOL *ServiceBinding = NULL;
+    EFI_HANDLE                         ChildHandle    = NULL;
+    EFI_HTTP_PROTOCOL                 *Http           = NULL;
+    BOOLEAN                            ChildCreated   = FALSE;
+    BOOLEAN                            HttpConfigured = FALSE;
+
+    Status = gBS->HandleProtocol(
+                    HandleBuffer[Index],
+                    &gEfiHttpServiceBindingProtocolGuid,
+                    (VOID **)&ServiceBinding
+                    );
+    if (EFI_ERROR(Status) || (ServiceBinding == NULL)) {
+      continue;
+    }
+
+    Status = ServiceBinding->CreateChild(ServiceBinding, &ChildHandle);
+    if (EFI_ERROR(Status) || (ChildHandle == NULL)) {
+      continue;
+    }
+    ChildCreated = TRUE;
+
+    Status = gBS->HandleProtocol(ChildHandle, &gEfiHttpProtocolGuid, (VOID **)&Http);
+    if (EFI_ERROR(Status) || (Http == NULL)) {
+      goto NextHandle;
+    }
+
+    EFI_HTTPv4_ACCESS_POINT AccessPoint;
+    ZeroMem(&AccessPoint, sizeof(AccessPoint));
+    AccessPoint.UseDefaultAddress = TRUE;
+    AccessPoint.LocalPort         = 0;
+
+    EFI_HTTP_CONFIG_DATA ConfigData;
+    ZeroMem(&ConfigData, sizeof(ConfigData));
+    ConfigData.HttpVersion        = HttpVersion11;
+    ConfigData.TimeOutMillisec    = 0;
+    ConfigData.LocalAddressIsIPv6 = FALSE;
+    ConfigData.AccessPoint.IPv4Node = &AccessPoint;
+
+    Status = Http->Configure(Http, &ConfigData);
+    if (EFI_ERROR(Status)) {
+      goto NextHandle;
+    }
+    HttpConfigured = TRUE;
+
+    CHAR8 ContentTypeName[]   = "Content-Type";
+    CHAR8 ContentTypeValue[]  = "application/json";
+    CHAR8 ContentLengthName[] = "Content-Length";
+    CHAR8 ContentLengthValue[32];
+    AsciiSPrint(ContentLengthValue, sizeof(ContentLengthValue), "%Lu", (UINT64)PayloadLength);
+
+    EFI_HTTP_HEADER RequestHeaders[2];
+    RequestHeaders[0].FieldName  = ContentTypeName;
+    RequestHeaders[0].FieldValue = ContentTypeValue;
+    RequestHeaders[1].FieldName  = ContentLengthName;
+    RequestHeaders[1].FieldValue = ContentLengthValue;
+
+    EFI_HTTP_REQUEST_DATA RequestData;
+    ZeroMem(&RequestData, sizeof(RequestData));
+    RequestData.Method = HttpMethodPost;
+    RequestData.Url    = ServerUrl;
+
+    EFI_HTTP_MESSAGE RequestMessage;
+    ZeroMem(&RequestMessage, sizeof(RequestMessage));
+    RequestMessage.Data.Request = &RequestData;
+    RequestMessage.HeaderCount  = ARRAY_SIZE(RequestHeaders);
+    RequestMessage.Headers      = RequestHeaders;
+    RequestMessage.BodyLength   = PayloadLength;
+    RequestMessage.Body         = (VOID *)JsonPayload;
+
+    EFI_HTTP_TOKEN RequestToken;
+    ZeroMem(&RequestToken, sizeof(RequestToken));
+    RequestToken.Message = &RequestMessage;
+
+    Status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, NULL, NULL, &RequestToken.Event);
+    if (EFI_ERROR(Status)) {
+      Result = Status;
+      goto NextHandle;
+    }
+
+    Status = Http->Request(Http, &RequestToken);
+    if (!EFI_ERROR(Status)) {
+      UINTN EventIndex;
+      Status = gBS->WaitForEvent(1, &RequestToken.Event, &EventIndex);
+      if (!EFI_ERROR(Status)) {
+        Status = RequestToken.Status;
+      }
+    }
+
+    gBS->CloseEvent(RequestToken.Event);
+    RequestToken.Event = NULL;
+
+    if (EFI_ERROR(Status)) {
+      Print(L"HTTP request failed: %r\n", Status);
+      Result = Status;
+      goto NextHandle;
+    }
+
+    EFI_HTTP_RESPONSE_DATA ResponseData;
+    EFI_HTTP_MESSAGE      ResponseMessage;
+    EFI_HTTP_TOKEN        ResponseToken;
+
+    ZeroMem(&ResponseData, sizeof(ResponseData));
+    ZeroMem(&ResponseMessage, sizeof(ResponseMessage));
+    ZeroMem(&ResponseToken, sizeof(ResponseToken));
+
+    ResponseMessage.Data.Response = &ResponseData;
+    ResponseToken.Message         = &ResponseMessage;
+
+    Status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, NULL, NULL, &ResponseToken.Event);
+    if (EFI_ERROR(Status)) {
+      Result = Status;
+      goto NextHandle;
+    }
+
+    Status = Http->Response(Http, &ResponseToken);
+    if (!EFI_ERROR(Status)) {
+      UINTN EventIndex;
+      Status = gBS->WaitForEvent(1, &ResponseToken.Event, &EventIndex);
+      if (!EFI_ERROR(Status)) {
+        Status = ResponseToken.Status;
+      }
+    }
+
+    gBS->CloseEvent(ResponseToken.Event);
+    ResponseToken.Event = NULL;
+
+    if (EFI_ERROR(Status) && (Status != EFI_HTTP_ERROR)) {
+      Print(L"HTTP response failed: %r\n", Status);
+      FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
+      Result = Status;
+      goto NextHandle;
+    }
+
+    if (Status == EFI_HTTP_ERROR) {
+      Print(L"Server returned HTTP error %u\n", (UINT32)ResponseData.StatusCode);
+      Result    = EFI_PROTOCOL_ERROR;
+      Completed = TRUE;
+    } else {
+      Print(L"Server returned HTTP status %u\n", (UINT32)ResponseData.StatusCode);
+      if ((ResponseData.StatusCode >= HTTP_STATUS_200_OK) &&
+          (ResponseData.StatusCode < HTTP_STATUS_300_MULTIPLE_CHOICES)) {
+        Result    = EFI_SUCCESS;
+      } else {
+        Result    = EFI_PROTOCOL_ERROR;
+      }
+      Completed = TRUE;
+    }
+
+    FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
+
+NextHandle:
+    if (HttpConfigured && (Http != NULL)) {
+      Http->Configure(Http, NULL);
+    }
+
+    if (ChildCreated && (ServiceBinding != NULL) && (ChildHandle != NULL)) {
+      ServiceBinding->DestroyChild(ServiceBinding, ChildHandle);
+    }
+
+    if (Completed) {
+      break;
+    }
+  }
+
+  if (!Completed && (Result == EFI_DEVICE_ERROR)) {
+    Print(L"Unable to send HTTP request using available handles.\n");
+  }
+
+  if (HandleBuffer != NULL) {
+    FreePool(HandleBuffer);
+  }
+
+  FreePool(ServerUrl);
+
+  return Result;
+}
+
+STATIC
 VOID
 RenderQuietRow(
   IN UINTN TotalModules
@@ -576,6 +1010,41 @@ ShowQrScreen(
   RenderQrCode(QrCode);
 }
 
+STATIC
+EFI_STATUS
+GetMenuSelection(
+  OUT CHAR16 *Selection
+  )
+{
+  if (Selection == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  while (TRUE) {
+    Print(L"Computer Information Utility\n");
+    Print(L"============================\n");
+    Print(L"1. Display QR code\n");
+    Print(L"2. Send system information to server\n");
+    Print(L"Q. Quit\n\n");
+    Print(L"Select an option: ");
+
+    EFI_INPUT_KEY Key;
+    EFI_STATUS    Status = WaitForKeyPress(&Key);
+    Print(L"\n");
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+
+    CHAR16 Value = Key.UnicodeChar;
+    if ((Value == L'1') || (Value == L'2') || (Value == L'Q') || (Value == L'q')) {
+      *Selection = Value;
+      return EFI_SUCCESS;
+    }
+
+    Print(L"Invalid selection. Please try again.\n\n");
+  }
+}
+
 EFI_STATUS
 EFIAPI
 UefiMain(
@@ -631,8 +1100,66 @@ UefiMain(
     return Status;
   }
 
-  ShowQrScreen(&QrCode);
-  WaitForKeyPress(NULL);
+  CHAR8 JsonPayload[JSON_PAYLOAD_BUFFER_LENGTH];
+  Status = BuildJsonPayload(JsonPayload, sizeof(JsonPayload), UuidString, MacString, SerialNumber);
+  if (EFI_ERROR(Status)) {
+    Print(L"Failed to build JSON payload: %r\n", Status);
+    return Status;
+  }
 
-  return EFI_SUCCESS;
+  UINTN JsonLength = AsciiStrLen(JsonPayload);
+  if (JsonLength == 0) {
+    Print(L"JSON payload is empty.\n");
+    return EFI_DEVICE_ERROR;
+  }
+
+  EFI_STATUS ReturnStatus   = EFI_SUCCESS;
+  BOOLEAN    ExitRequested  = FALSE;
+
+  while (!ExitRequested) {
+    if ((gST != NULL) && (gST->ConOut != NULL)) {
+      gST->ConOut->ClearScreen(gST->ConOut);
+    }
+
+    CHAR16 Selection;
+    Status = GetMenuSelection(&Selection);
+    if (EFI_ERROR(Status)) {
+      ReturnStatus = Status;
+      break;
+    }
+
+    switch (Selection) {
+      case L'1':
+        ShowQrScreen(&QrCode);
+        Print(L"\nPress any key to return to the menu...\n");
+        WaitForKeyPress(NULL);
+        break;
+
+      case L'2':
+        Print(L"Sending system information to the server...\n\n");
+        Status = PostSystemInfoToServer(JsonPayload, JsonLength);
+        if (EFI_ERROR(Status)) {
+          Print(L"\nFailed to send system information: %r\n", Status);
+        } else {
+          Print(L"\nSystem information successfully sent.\n");
+        }
+        Print(L"\nPress any key to return to the menu...\n");
+        WaitForKeyPress(NULL);
+        break;
+
+      case L'Q':
+      case L'q':
+        ExitRequested = TRUE;
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  if ((gST != NULL) && (gST->ConOut != NULL)) {
+    gST->ConOut->ClearScreen(gST->ConOut);
+  }
+
+  return ReturnStatus;
 }
