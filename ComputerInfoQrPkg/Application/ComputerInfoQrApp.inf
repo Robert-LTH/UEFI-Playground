@@ -34,5 +34,8 @@
 
 [Protocols]
   gEfiGraphicsOutputProtocolGuid
+  gEfiDhcp4ProtocolGuid
+  gEfiHttpProtocolGuid
+  gEfiHttpServiceBindingProtocolGuid
   gEfiSimpleNetworkProtocolGuid
   gEfiSmbiosProtocolGuid
