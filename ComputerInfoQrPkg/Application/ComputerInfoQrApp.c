@@ -35,6 +35,12 @@
 #define IPV4_STRING_BUFFER_LENGTH           16
 
 STATIC
+EFI_STATUS
+WaitForKeyPress(
+  OUT EFI_INPUT_KEY *Key OPTIONAL
+  );
+
+STATIC
 BOOLEAN
 IsAsciiSpaceCharacter(
   IN CHAR8 Character
@@ -668,6 +674,191 @@ PrintDhcpOptions(
 
 STATIC
 VOID
+DisplayDhcpInterfaceInformation(
+  IN EFI_HANDLE Handle,
+  IN UINTN      Index
+  )
+{
+  EFI_STATUS Status;
+
+  Print(L"DHCPv4 Interface %u\n", (UINT32)(Index + 1));
+  Print(L"---------------------\n");
+  Print(L"  Handle: %p\n", Handle);
+
+  EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
+  Status = gBS->HandleProtocol(
+                      Handle,
+                      &gEfiDhcp4ProtocolGuid,
+                      (VOID **)&Dhcp4
+                      );
+  if (EFI_ERROR(Status) || (Dhcp4 == NULL)) {
+    Print(L"  Unable to open EFI_DHCP4_PROTOCOL: %r\n\n", Status);
+    return;
+  }
+
+  EFI_DHCP4_MODE_DATA ModeData;
+  ZeroMem(&ModeData, sizeof(ModeData));
+
+  Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
+  if (EFI_ERROR(Status)) {
+    Print(L"  GetModeData failed: %r\n\n", Status);
+    return;
+  }
+
+  Print(L"  State: %s (%u)\n", Dhcp4StateToString(ModeData.State), (UINT32)ModeData.State);
+
+  UINTN                        MacAddressSize = 0;
+  EFI_SIMPLE_NETWORK_PROTOCOL *Snp            = NULL;
+  Status = gBS->HandleProtocol(
+                      Handle,
+                      &gEfiSimpleNetworkProtocolGuid,
+                      (VOID **)&Snp
+                      );
+  if (!EFI_ERROR(Status) && (Snp != NULL) && (Snp->Mode != NULL)) {
+    MacAddressSize = Snp->Mode->HwAddressSize;
+  }
+  if ((MacAddressSize == 0) && (ModeData.ReplyPacket != NULL)) {
+    MacAddressSize = ModeData.ReplyPacket->Dhcp4.Header.HwAddrLen;
+  }
+  if (MacAddressSize > MAC_ADDRESS_MAX_BYTES) {
+    MacAddressSize = MAC_ADDRESS_MAX_BYTES;
+  }
+
+  CHAR8 MacString[MAC_STRING_BUFFER_LENGTH];
+  MacAddressToString(&ModeData.ClientMacAddress, MacAddressSize, MacString, sizeof(MacString));
+  if (MacString[0] == '\0') {
+    AsciiStrCpyS(MacString, sizeof(MacString), UNKNOWN_STRING);
+  }
+  Print(L"  Client MAC: %a\n", MacString);
+
+  CHAR16 AddressString[IPV4_STRING_BUFFER_LENGTH];
+
+  Ipv4AddressToString(&ModeData.ClientAddress, AddressString, sizeof(AddressString));
+  Print(L"  Client IP: %s\n", AddressString);
+
+  Ipv4AddressToString(&ModeData.ServerAddress, AddressString, sizeof(AddressString));
+  Print(L"  DHCP Server: %s\n", AddressString);
+
+  Ipv4AddressToString(&ModeData.RouterAddress, AddressString, sizeof(AddressString));
+  Print(L"  Router: %s\n", AddressString);
+
+  Ipv4AddressToString(&ModeData.SubnetMask, AddressString, sizeof(AddressString));
+  Print(L"  Subnet Mask: %s\n", AddressString);
+
+  if (ModeData.LeaseTime == 0xFFFFFFFF) {
+    Print(L"  Lease Time: Infinite\n");
+  } else {
+    Print(L"  Lease Time: %u seconds\n", (UINT32)ModeData.LeaseTime);
+  }
+
+  if (ModeData.ReplyPacket != NULL) {
+    Print(L"  DHCP Reply Packet Length: %u bytes\n", ModeData.ReplyPacket->Length);
+    Print(L"  DHCP Transaction ID: 0x%08X\n", ModeData.ReplyPacket->Dhcp4.Header.Xid);
+
+    Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.YourAddr, AddressString, sizeof(AddressString));
+    Print(L"  Assigned IP (packet): %s\n", AddressString);
+
+    Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.ServerAddr, AddressString, sizeof(AddressString));
+    Print(L"  Server IP (packet): %s\n", AddressString);
+
+    Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.GatewayAddr, AddressString, sizeof(AddressString));
+    Print(L"  Gateway IP (packet): %s\n", AddressString);
+
+    CHAR8 ServerName[sizeof(ModeData.ReplyPacket->Dhcp4.Header.ServerName) + 1];
+    ZeroMem(ServerName, sizeof(ServerName));
+    CopyMem(
+      ServerName,
+      ModeData.ReplyPacket->Dhcp4.Header.ServerName,
+      sizeof(ModeData.ReplyPacket->Dhcp4.Header.ServerName)
+      );
+    if (ServerName[0] != '\0') {
+      Print(L"  DHCP Server Name: %a\n", ServerName);
+    }
+
+    CHAR8 BootFileName[sizeof(ModeData.ReplyPacket->Dhcp4.Header.BootFileName) + 1];
+    ZeroMem(BootFileName, sizeof(BootFileName));
+    CopyMem(
+      BootFileName,
+      ModeData.ReplyPacket->Dhcp4.Header.BootFileName,
+      sizeof(ModeData.ReplyPacket->Dhcp4.Header.BootFileName)
+      );
+    if (BootFileName[0] != '\0') {
+      Print(L"  Boot File Name: %a\n", BootFileName);
+    }
+
+    Print(L"  DHCP Options:\n");
+    PrintDhcpOptions(ModeData.ReplyPacket);
+  } else {
+    Print(L"  No DHCP reply packet cached for this interface.\n");
+  }
+
+  Print(L"\n");
+}
+
+STATIC
+EFI_STATUS
+RenewDhcpLeaseOnHandle(
+  IN EFI_HANDLE Handle
+  )
+{
+  if (Handle == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
+  EFI_STATUS          Status;
+
+  Status = gBS->HandleProtocol(
+                      Handle,
+                      &gEfiDhcp4ProtocolGuid,
+                      (VOID **)&Dhcp4
+                      );
+  if (EFI_ERROR(Status) || (Dhcp4 == NULL)) {
+    if (!EFI_ERROR(Status)) {
+      Status = EFI_DEVICE_ERROR;
+    }
+    return Status;
+  }
+
+  if (Dhcp4->RenewRebind == NULL) {
+    return EFI_UNSUPPORTED;
+  }
+
+  Status = Dhcp4->RenewRebind(Dhcp4, FALSE);
+  if (Status == EFI_NO_MAPPING) {
+    Status = Dhcp4->RenewRebind(Dhcp4, TRUE);
+  }
+
+  return Status;
+}
+
+STATIC
+VOID
+RenewDhcpLeases(
+  IN EFI_HANDLE *HandleBuffer,
+  IN UINTN       HandleCount
+  )
+{
+  if ((HandleBuffer == NULL) || (HandleCount == 0)) {
+    return;
+  }
+
+  Print(L"Attempting to renew DHCP lease(s)...\n");
+
+  for (UINTN Index = 0; Index < HandleCount; Index++) {
+    EFI_STATUS Status = RenewDhcpLeaseOnHandle(HandleBuffer[Index]);
+    if (EFI_ERROR(Status)) {
+      Print(L"  Interface %u: Failed to renew DHCP lease: %r\n", (UINT32)(Index + 1), Status);
+    } else {
+      Print(L"  Interface %u: DHCP lease renewal requested successfully.\n", (UINT32)(Index + 1));
+    }
+  }
+
+  Print(L"\n");
+}
+
+STATIC
+VOID
 ShowNetworkInformation(
   VOID
   )
@@ -685,128 +876,38 @@ ShowNetworkInformation(
                           &HandleCount,
                           &HandleBuffer
                           );
-  if (EFI_ERROR(Status) || (HandleCount == 0) || (HandleBuffer == NULL)) {
+  if (EFI_ERROR(Status) || (HandleBuffer == NULL) || (HandleCount == 0)) {
     if (EFI_ERROR(Status)) {
       Print(L"Unable to locate DHCPv4 handles: %r\n", Status);
     } else {
       Print(L"No DHCPv4 interfaces found.\n");
     }
+
+    Print(L"\nPress any key to return to the menu...\n");
+    WaitForKeyPress(NULL);
     goto Cleanup;
   }
 
   for (UINTN Index = 0; Index < HandleCount; Index++) {
-    Print(L"DHCPv4 Interface %u\n", (UINT32)(Index + 1));
-    Print(L"---------------------\n");
-    Print(L"  Handle: %p\n", HandleBuffer[Index]);
+    DisplayDhcpInterfaceInformation(HandleBuffer[Index], Index);
+  }
 
-    EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
-    Status = gBS->HandleProtocol(
-                    HandleBuffer[Index],
-                    &gEfiDhcp4ProtocolGuid,
-                    (VOID **)&Dhcp4
-                    );
-    if (EFI_ERROR(Status) || (Dhcp4 == NULL)) {
-      Print(L"  Unable to open EFI_DHCP4_PROTOCOL: %r\n\n", Status);
-      continue;
+  Print(L"Press 'R' to renew the DHCP lease(s) or press any other key to return to the menu.\n");
+
+  EFI_INPUT_KEY Key;
+  Status = WaitForKeyPress(&Key);
+  Print(L"\n");
+
+  if (!EFI_ERROR(Status) && ((Key.UnicodeChar == L'R') || (Key.UnicodeChar == L'r'))) {
+    RenewDhcpLeases(HandleBuffer, HandleCount);
+
+    Print(L"Updated networking information:\n\n");
+    for (UINTN Index = 0; Index < HandleCount; Index++) {
+      DisplayDhcpInterfaceInformation(HandleBuffer[Index], Index);
     }
 
-    EFI_DHCP4_MODE_DATA ModeData;
-    ZeroMem(&ModeData, sizeof(ModeData));
-
-    Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
-    if (EFI_ERROR(Status)) {
-      Print(L"  GetModeData failed: %r\n\n", Status);
-      continue;
-    }
-
-    Print(L"  State: %s (%u)\n", Dhcp4StateToString(ModeData.State), (UINT32)ModeData.State);
-
-    UINTN MacAddressSize = 0;
-    EFI_SIMPLE_NETWORK_PROTOCOL *Snp = NULL;
-    Status = gBS->HandleProtocol(
-                    HandleBuffer[Index],
-                    &gEfiSimpleNetworkProtocolGuid,
-                    (VOID **)&Snp
-                    );
-    if (!EFI_ERROR(Status) && (Snp != NULL) && (Snp->Mode != NULL)) {
-      MacAddressSize = Snp->Mode->HwAddressSize;
-    }
-    if ((MacAddressSize == 0) && (ModeData.ReplyPacket != NULL)) {
-      MacAddressSize = ModeData.ReplyPacket->Dhcp4.Header.HwAddrLen;
-    }
-    if (MacAddressSize > MAC_ADDRESS_MAX_BYTES) {
-      MacAddressSize = MAC_ADDRESS_MAX_BYTES;
-    }
-
-    CHAR8 MacString[MAC_STRING_BUFFER_LENGTH];
-    MacAddressToString(&ModeData.ClientMacAddress, MacAddressSize, MacString, sizeof(MacString));
-    if (MacString[0] == '\0') {
-      AsciiStrCpyS(MacString, sizeof(MacString), UNKNOWN_STRING);
-    }
-    Print(L"  Client MAC: %a\n", MacString);
-
-    CHAR16 AddressString[IPV4_STRING_BUFFER_LENGTH];
-
-    Ipv4AddressToString(&ModeData.ClientAddress, AddressString, sizeof(AddressString));
-    Print(L"  Client IP: %s\n", AddressString);
-
-    Ipv4AddressToString(&ModeData.ServerAddress, AddressString, sizeof(AddressString));
-    Print(L"  DHCP Server: %s\n", AddressString);
-
-    Ipv4AddressToString(&ModeData.RouterAddress, AddressString, sizeof(AddressString));
-    Print(L"  Router: %s\n", AddressString);
-
-    Ipv4AddressToString(&ModeData.SubnetMask, AddressString, sizeof(AddressString));
-    Print(L"  Subnet Mask: %s\n", AddressString);
-
-    if (ModeData.LeaseTime == 0xFFFFFFFF) {
-      Print(L"  Lease Time: Infinite\n");
-    } else {
-      Print(L"  Lease Time: %u seconds\n", (UINT32)ModeData.LeaseTime);
-    }
-
-    if (ModeData.ReplyPacket != NULL) {
-      Print(L"  DHCP Reply Packet Length: %u bytes\n", ModeData.ReplyPacket->Length);
-      Print(L"  DHCP Transaction ID: 0x%08X\n", ModeData.ReplyPacket->Dhcp4.Header.Xid);
-
-      Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.YourAddr, AddressString, sizeof(AddressString));
-      Print(L"  Assigned IP (packet): %s\n", AddressString);
-
-      Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.ServerAddr, AddressString, sizeof(AddressString));
-      Print(L"  Server IP (packet): %s\n", AddressString);
-
-      Ipv4AddressToString(&ModeData.ReplyPacket->Dhcp4.Header.GatewayAddr, AddressString, sizeof(AddressString));
-      Print(L"  Gateway IP (packet): %s\n", AddressString);
-
-      CHAR8 ServerName[sizeof(ModeData.ReplyPacket->Dhcp4.Header.ServerName) + 1];
-      ZeroMem(ServerName, sizeof(ServerName));
-      CopyMem(
-        ServerName,
-        ModeData.ReplyPacket->Dhcp4.Header.ServerName,
-        sizeof(ModeData.ReplyPacket->Dhcp4.Header.ServerName)
-        );
-      if (ServerName[0] != '\0') {
-        Print(L"  DHCP Server Name: %a\n", ServerName);
-      }
-
-      CHAR8 BootFileName[sizeof(ModeData.ReplyPacket->Dhcp4.Header.BootFileName) + 1];
-      ZeroMem(BootFileName, sizeof(BootFileName));
-      CopyMem(
-        BootFileName,
-        ModeData.ReplyPacket->Dhcp4.Header.BootFileName,
-        sizeof(ModeData.ReplyPacket->Dhcp4.Header.BootFileName)
-        );
-      if (BootFileName[0] != '\0') {
-        Print(L"  Boot File Name: %a\n", BootFileName);
-      }
-
-      Print(L"  DHCP Options:\n");
-      PrintDhcpOptions(ModeData.ReplyPacket);
-    } else {
-      Print(L"  No DHCP reply packet cached for this interface.\n");
-    }
-
-    Print(L"\n");
+    Print(L"Press any key to return to the menu...\n");
+    WaitForKeyPress(NULL);
   }
 
 Cleanup:
@@ -1437,8 +1538,6 @@ UefiMain(
 
       case L'3':
         ShowNetworkInformation();
-        Print(L"\nPress any key to return to the menu...\n");
-        WaitForKeyPress(NULL);
         break;
 
       case L'Q':
