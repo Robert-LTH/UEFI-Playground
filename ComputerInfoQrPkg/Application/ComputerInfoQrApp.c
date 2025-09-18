@@ -495,6 +495,14 @@ GetServerUrlFromDhcp(
   EFI_STATUS Result = EFI_NOT_FOUND;
 
   for (UINTN Index = 0; Index < HandleCount; Index++) {
+    Status = InitializeNicOnHandle(HandleBuffer[Index]);
+    if (EFI_ERROR(Status)) {
+      if ((Result == EFI_NOT_FOUND) && (Status != EFI_NOT_FOUND)) {
+        Result = Status;
+      }
+      continue;
+    }
+
     EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
     Status = gBS->HandleProtocol(
                     HandleBuffer[Index],
@@ -507,6 +515,13 @@ GetServerUrlFromDhcp(
 
     EFI_DHCP4_MODE_DATA ModeData;
     ZeroMem(&ModeData, sizeof(ModeData));
+
+    if (Dhcp4->GetModeData == NULL) {
+      if (Result == EFI_NOT_FOUND) {
+        Result = EFI_UNSUPPORTED;
+      }
+      continue;
+    }
 
     Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
     if (EFI_ERROR(Status) || (ModeData.ReplyPacket == NULL)) {
