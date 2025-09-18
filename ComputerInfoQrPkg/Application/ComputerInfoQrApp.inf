@@ -39,3 +39,7 @@
   gEfiHttpServiceBindingProtocolGuid
   gEfiSimpleNetworkProtocolGuid
   gEfiSmbiosProtocolGuid
+
+[Guids]
+  gEfiSmbiosTableGuid
+  gEfiSmbios3TableGuid
