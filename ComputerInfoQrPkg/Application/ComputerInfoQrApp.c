@@ -1,6 +1,7 @@
 #include <Uefi.h>
 
 #include <IndustryStandard/SmBios.h>
+#include <Guid/SmBios.h>
 #include <Library/BaseLib.h>
 #include <Library/BaseMemoryLib.h>
 #include <Library/MemoryAllocationLib.h>
@@ -140,6 +141,280 @@ CopySmbiosString(
 }
 
 STATIC
+CHAR8
+AsciiToUpperChar(
+  IN CHAR8 Character
+  )
+{
+  if ((Character >= 'a') && (Character <= 'z')) {
+    return (CHAR8)(Character - ('a' - 'A'));
+  }
+
+  return Character;
+}
+
+STATIC
+BOOLEAN
+AsciiStringsEqualIgnoreCase(
+  IN CONST CHAR8 *First,
+  IN CONST CHAR8 *Second
+  )
+{
+  if ((First == NULL) || (Second == NULL)) {
+    return FALSE;
+  }
+
+  while ((*First != '\0') && (*Second != '\0')) {
+    if (AsciiToUpperChar(*First) != AsciiToUpperChar(*Second)) {
+      return FALSE;
+    }
+
+    First++;
+    Second++;
+  }
+
+  return ((*First == '\0') && (*Second == '\0'));
+}
+
+STATIC
+BOOLEAN
+IsMeaningfulSerialString(
+  IN CONST CHAR8 *Serial
+  )
+{
+  if ((Serial == NULL) || (Serial[0] == '\0')) {
+    return FALSE;
+  }
+
+  if (AsciiStringsEqualIgnoreCase(Serial, "UNKNOWN") ||
+      AsciiStringsEqualIgnoreCase(Serial, "NOT SPECIFIED") ||
+      AsciiStringsEqualIgnoreCase(Serial, "NONE") ||
+      AsciiStringsEqualIgnoreCase(Serial, "DEFAULT STRING") ||
+      AsciiStringsEqualIgnoreCase(Serial, "SYSTEM SERIAL NUMBER") ||
+      AsciiStringsEqualIgnoreCase(Serial, "TO BE FILLED BY O.E.M.") ||
+      AsciiStringsEqualIgnoreCase(Serial, "TO BE FILLED BY OEM")) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+STATIC
+BOOLEAN
+TryCopyMeaningfulSmbiosSerial(
+  OUT CHAR8                  *SerialNumber,
+  IN  UINTN                   SerialBufferLength,
+  IN  CONST SMBIOS_STRUCTURE *Record,
+  IN  UINTN                   StringNumber
+  )
+{
+  if ((SerialNumber == NULL) || (SerialBufferLength == 0) || (Record == NULL) || (StringNumber == 0)) {
+    return FALSE;
+  }
+
+  CHAR8 TempSerial[SERIAL_NUMBER_BUFFER_LENGTH];
+  ZeroMem(TempSerial, sizeof(TempSerial));
+
+  CopySmbiosString(TempSerial, sizeof(TempSerial), Record, StringNumber);
+  TrimAndSanitizeSerialNumber(TempSerial);
+
+  if (!IsMeaningfulSerialString(TempSerial)) {
+    return FALSE;
+  }
+
+  AsciiStrCpyS(SerialNumber, SerialBufferLength, TempSerial);
+  return TRUE;
+}
+
+STATIC
+EFI_STATUS
+GetSmbiosRawTable(
+  OUT CONST UINT8 **TableStart,
+  OUT UINTN        *TableLength
+  )
+{
+  if ((TableStart == NULL) || (TableLength == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *TableStart  = NULL;
+  *TableLength = 0;
+
+  if ((gST == NULL) || (gST->ConfigurationTable == NULL)) {
+    return EFI_NOT_READY;
+  }
+
+  for (UINTN Index = 0; Index < gST->NumberOfTableEntries; Index++) {
+    EFI_CONFIGURATION_TABLE *Entry = &gST->ConfigurationTable[Index];
+
+    if (CompareGuid(&Entry->VendorGuid, &gEfiSmbios3TableGuid)) {
+      SMBIOS_TABLE_3_0_ENTRY_POINT *EntryPoint = (SMBIOS_TABLE_3_0_ENTRY_POINT *)Entry->VendorTable;
+      if ((EntryPoint == NULL) || (EntryPoint->TableAddress == 0) || (EntryPoint->TableMaximumSize == 0)) {
+        continue;
+      }
+
+      *TableStart  = (CONST UINT8 *)(UINTN)EntryPoint->TableAddress;
+      *TableLength = (UINTN)EntryPoint->TableMaximumSize;
+      return EFI_SUCCESS;
+    }
+
+    if (CompareGuid(&Entry->VendorGuid, &gEfiSmbiosTableGuid)) {
+      SMBIOS_TABLE_ENTRY_POINT *EntryPoint = (SMBIOS_TABLE_ENTRY_POINT *)Entry->VendorTable;
+      if ((EntryPoint == NULL) || (EntryPoint->TableAddress == 0) || (EntryPoint->TableLength == 0)) {
+        continue;
+      }
+
+      *TableStart  = (CONST UINT8 *)(UINTN)EntryPoint->TableAddress;
+      *TableLength = (UINTN)EntryPoint->TableLength;
+      return EFI_SUCCESS;
+    }
+  }
+
+  return EFI_NOT_FOUND;
+}
+
+STATIC
+VOID
+UpdateUuidAndSerialFromRecord(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT BOOLEAN            *UuidFound,
+  IN OUT BOOLEAN            *SerialFound,
+  OUT EFI_GUID              *SystemUuid,
+  OUT CHAR8                 *SerialNumber,
+  IN UINTN                   SerialBufferLength
+  )
+{
+  if ((Record == NULL) || (Record->Length == 0)) {
+    return;
+  }
+
+  BOOLEAN NeedUuid   = (UuidFound != NULL) && !(*UuidFound) && (SystemUuid != NULL);
+  BOOLEAN NeedSerial = (SerialFound != NULL) && !(*SerialFound) && (SerialNumber != NULL) && (SerialBufferLength > 0);
+
+  if (!NeedUuid && !NeedSerial) {
+    return;
+  }
+
+  UINT8 CurrentType = Record->Type;
+
+  if (CurrentType == SMBIOS_TYPE_SYSTEM_INFORMATION) {
+    CONST SMBIOS_TABLE_TYPE1 *Type1 = (CONST SMBIOS_TABLE_TYPE1 *)Record;
+
+    if (NeedUuid) {
+      if ((UINTN)Record->Length >= (OFFSET_OF(SMBIOS_TABLE_TYPE1, Uuid) + sizeof(EFI_GUID))) {
+        EFI_GUID CandidateUuid;
+        CopyMem(&CandidateUuid, &Type1->Uuid, sizeof(EFI_GUID));
+        if (IsValidUuid(&CandidateUuid)) {
+          CopyMem(SystemUuid, &CandidateUuid, sizeof(EFI_GUID));
+          *UuidFound = TRUE;
+          NeedUuid   = FALSE;
+        }
+      }
+    }
+
+    if (NeedSerial && ((UINTN)Record->Length > OFFSET_OF(SMBIOS_TABLE_TYPE1, SerialNumber))) {
+      if (TryCopyMeaningfulSmbiosSerial(SerialNumber, SerialBufferLength, Record, Type1->SerialNumber)) {
+        *SerialFound = TRUE;
+        NeedSerial   = FALSE;
+      }
+    }
+  }
+
+  if (NeedSerial && (CurrentType == SMBIOS_TYPE_BASEBOARD_INFORMATION) &&
+      ((UINTN)Record->Length > OFFSET_OF(SMBIOS_TABLE_TYPE2, SerialNumber))) {
+    CONST SMBIOS_TABLE_TYPE2 *Type2 = (CONST SMBIOS_TABLE_TYPE2 *)Record;
+    if (TryCopyMeaningfulSmbiosSerial(SerialNumber, SerialBufferLength, Record, Type2->SerialNumber)) {
+      *SerialFound = TRUE;
+      NeedSerial   = FALSE;
+    }
+  }
+
+  if (NeedSerial && (CurrentType == SMBIOS_TYPE_SYSTEM_ENCLOSURE) &&
+      ((UINTN)Record->Length > OFFSET_OF(SMBIOS_TABLE_TYPE3, SerialNumber))) {
+    CONST SMBIOS_TABLE_TYPE3 *Type3 = (CONST SMBIOS_TABLE_TYPE3 *)Record;
+    if (TryCopyMeaningfulSmbiosSerial(SerialNumber, SerialBufferLength, Record, Type3->SerialNumber)) {
+      *SerialFound = TRUE;
+    }
+  }
+}
+
+STATIC
+VOID
+ScanRawSmbiosTable(
+  IN CONST UINT8 *TableStart,
+  IN UINTN        TableLength,
+  IN OUT BOOLEAN *UuidFound,
+  IN OUT BOOLEAN *SerialFound,
+  OUT EFI_GUID   *SystemUuid,
+  OUT CHAR8      *SerialNumber,
+  IN UINTN        SerialBufferLength
+  )
+{
+  if ((TableStart == NULL) || (TableLength == 0)) {
+    return;
+  }
+
+  CONST UINT8 *Current = TableStart;
+  CONST UINT8 *End     = TableStart + TableLength;
+
+  while (Current < End) {
+    if ((UINTN)(End - Current) < sizeof(SMBIOS_STRUCTURE)) {
+      break;
+    }
+
+    CONST SMBIOS_STRUCTURE *Header = (CONST SMBIOS_STRUCTURE *)Current;
+    UINTN                   StructureLength = (UINTN)Header->Length;
+
+    if (StructureLength == 0) {
+      break;
+    }
+
+    if ((Current + StructureLength) > End) {
+      break;
+    }
+
+    UpdateUuidAndSerialFromRecord(
+      Header,
+      UuidFound,
+      SerialFound,
+      SystemUuid,
+      SerialNumber,
+      SerialBufferLength
+      );
+
+    if (((UuidFound == NULL) || (*UuidFound)) && ((SerialFound == NULL) || (*SerialFound))) {
+      break;
+    }
+
+    CONST UINT8 *Next = Current + StructureLength;
+
+    while (Next < End) {
+      if (*Next == 0) {
+        Next++;
+        if ((Next < End) && (*Next == 0)) {
+          Next++;
+          break;
+        }
+
+        continue;
+      }
+
+      Next++;
+    }
+
+    if (Next >= End) {
+      break;
+    }
+
+    if (Header->Type == SMBIOS_TYPE_END_OF_TABLE) {
+      break;
+    }
+
+    Current = Next;
+  }
+}
+
+STATIC
 BOOLEAN
 IsValidUuid(
   IN CONST EFI_GUID *Guid
@@ -173,42 +448,76 @@ GetSystemUuidAndSerial(
   IN  UINTN     SerialBufferLength
   )
 {
-  if (SystemUuid != NULL) {
+  BOOLEAN NeedUuid   = (SystemUuid != NULL);
+  BOOLEAN NeedSerial = (SerialNumber != NULL) && (SerialBufferLength > 0);
+
+  if (NeedUuid) {
     ZeroMem(SystemUuid, sizeof(EFI_GUID));
   }
 
-  if ((SerialNumber != NULL) && (SerialBufferLength > 0)) {
+  if (NeedSerial) {
     SerialNumber[0] = '\0';
   }
 
-  EFI_SMBIOS_PROTOCOL *Smbios;
-  EFI_STATUS           Status = gBS->LocateProtocol(&gEfiSmbiosProtocolGuid, NULL, (VOID **)&Smbios);
-  if (EFI_ERROR(Status)) {
+  if (!NeedUuid && !NeedSerial) {
     return;
   }
 
-  EFI_SMBIOS_HANDLE       Handle = SMBIOS_HANDLE_PI_RESERVED;
-  EFI_SMBIOS_TYPE         Type;
-  EFI_SMBIOS_TABLE_HEADER *Record;
+  BOOLEAN UuidFound   = !NeedUuid;
+  BOOLEAN SerialFound = !NeedSerial;
 
-  while (TRUE) {
-    Status = Smbios->GetNext(Smbios, &Handle, &Type, &Record, NULL);
-    if (EFI_ERROR(Status)) {
-      break;
-    }
+  EFI_SMBIOS_PROTOCOL *Smbios = NULL;
+  EFI_STATUS           Status = gBS->LocateProtocol(&gEfiSmbiosProtocolGuid, NULL, (VOID **)&Smbios);
+  if (!EFI_ERROR(Status) && (Smbios != NULL)) {
+    EFI_SMBIOS_HANDLE       Handle = SMBIOS_HANDLE_PI_RESERVED;
+    EFI_SMBIOS_TABLE_HEADER *Record;
 
-    if (Type == SMBIOS_TYPE_SYSTEM_INFORMATION) {
-      SMBIOS_TABLE_TYPE1 *Type1 = (SMBIOS_TABLE_TYPE1 *)Record;
-      if (SystemUuid != NULL) {
-        CopyMem(SystemUuid, &Type1->Uuid, sizeof(EFI_GUID));
+    while (TRUE) {
+      Status = Smbios->GetNext(Smbios, &Handle, NULL, &Record, NULL);
+      if (EFI_ERROR(Status)) {
+        break;
       }
 
-      if ((SerialNumber != NULL) && (SerialBufferLength > 0)) {
-        CopySmbiosString(SerialNumber, SerialBufferLength, (SMBIOS_STRUCTURE *)Record, Type1->SerialNumber);
+      if (Record == NULL) {
+        continue;
       }
-      break;
+
+      UpdateUuidAndSerialFromRecord(
+        (CONST SMBIOS_STRUCTURE *)Record,
+        NeedUuid ? &UuidFound : NULL,
+        NeedSerial ? &SerialFound : NULL,
+        SystemUuid,
+        SerialNumber,
+        SerialBufferLength
+        );
+
+      if (UuidFound && SerialFound) {
+        break;
+      }
     }
   }
+
+  if (UuidFound && SerialFound) {
+    return;
+  }
+
+  CONST UINT8 *RawTable       = NULL;
+  UINTN        RawTableLength = 0;
+
+  Status = GetSmbiosRawTable(&RawTable, &RawTableLength);
+  if (EFI_ERROR(Status) || (RawTable == NULL) || (RawTableLength == 0)) {
+    return;
+  }
+
+  ScanRawSmbiosTable(
+    RawTable,
+    RawTableLength,
+    NeedUuid ? &UuidFound : NULL,
+    NeedSerial ? &SerialFound : NULL,
+    SystemUuid,
+    SerialNumber,
+    SerialBufferLength
+    );
 }
 
 STATIC
@@ -983,7 +1292,7 @@ InitializeNicOnHandle(
   }
 
   if (ConnectHandle == NULL) {
-    return Status;
+    return EFI_SUCCESS;
   }
 
   EFI_STATUS ConnectStatus = ConnectNetworkController(ConnectHandle);
@@ -1015,7 +1324,12 @@ InitializeNicOnHandle(
     return EFI_DEVICE_ERROR;
   }
 
-  return StartSimpleNetworkProtocolInstance(RefreshedSnp);
+  EFI_STATUS FinalStatus = StartSimpleNetworkProtocolInstance(RefreshedSnp);
+  if (FinalStatus == EFI_UNSUPPORTED) {
+    FinalStatus = EFI_SUCCESS;
+  }
+
+  return FinalStatus;
 }
 
 STATIC
@@ -1032,7 +1346,9 @@ DisplayDhcpInterfaceInformation(
   Print(L"  Handle: %p\n", Handle);
 
   Status = InitializeNicOnHandle(Handle);
-  if (EFI_ERROR(Status)) {
+  if (Status == EFI_UNSUPPORTED) {
+    Print(L"  Network interface initialization is not supported; continuing with available information.\n");
+  } else if (EFI_ERROR(Status)) {
     Print(L"  Unable to initialize network interface: %r\n\n", Status);
     return;
   }
