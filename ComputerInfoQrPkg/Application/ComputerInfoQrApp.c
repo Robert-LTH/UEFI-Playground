@@ -872,9 +872,9 @@ RenewDhcpLeaseOnHandle(
     return EFI_UNSUPPORTED;
   }
 
-  Status = Dhcp4->RenewRebind(Dhcp4, FALSE);
+  Status = Dhcp4->RenewRebind(Dhcp4, FALSE, NULL);
   if (Status == EFI_NO_MAPPING) {
-    Status = Dhcp4->RenewRebind(Dhcp4, TRUE);
+    Status = Dhcp4->RenewRebind(Dhcp4, TRUE, NULL);
   }
 
   return Status;
