@@ -673,6 +673,213 @@ PrintDhcpOptions(
 }
 
 STATIC
+EFI_STATUS
+GetControllerHandleForChildProtocol(
+  IN  EFI_HANDLE ChildHandle,
+  IN  EFI_GUID   *ProtocolGuid,
+  OUT EFI_HANDLE *ControllerHandle
+  )
+{
+  if ((ChildHandle == NULL) || (ProtocolGuid == NULL) || (ControllerHandle == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *ControllerHandle = NULL;
+
+  EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *OpenInfo   = NULL;
+  UINTN                                EntryCount = 0;
+
+  EFI_STATUS Status = gBS->OpenProtocolInformation(
+                          ChildHandle,
+                          ProtocolGuid,
+                          &OpenInfo,
+                          &EntryCount
+                          );
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  EFI_STATUS Result = EFI_NOT_FOUND;
+
+  for (UINTN Index = 0; Index < EntryCount; Index++) {
+    EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *Entry = &OpenInfo[Index];
+    if ((Entry->Attributes & EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER) != 0) {
+      if (Entry->ControllerHandle != NULL) {
+        *ControllerHandle = Entry->ControllerHandle;
+        Result            = EFI_SUCCESS;
+        break;
+      }
+    }
+  }
+
+  if (OpenInfo != NULL) {
+    FreePool(OpenInfo);
+  }
+
+  return Result;
+}
+
+STATIC
+EFI_STATUS
+OpenSimpleNetworkProtocolForHandle(
+  IN  EFI_HANDLE                    Handle,
+  OUT EFI_SIMPLE_NETWORK_PROTOCOL **Snp,
+  OUT EFI_HANDLE                   *ProviderHandle OPTIONAL,
+  OUT EFI_HANDLE                   *ControllerHandle OPTIONAL
+  )
+{
+  if ((Handle == NULL) || (Snp == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *Snp = NULL;
+  if (ProviderHandle != NULL) {
+    *ProviderHandle = NULL;
+  }
+  if (ControllerHandle != NULL) {
+    *ControllerHandle = NULL;
+  }
+
+  EFI_SIMPLE_NETWORK_PROTOCOL *LocalSnp      = NULL;
+  EFI_HANDLE                   LocalController;
+  EFI_STATUS                   Status;
+  EFI_STATUS                   ProtocolStatus;
+  EFI_STATUS                   ControllerStatus;
+
+  Status = gBS->HandleProtocol(
+                  Handle,
+                  &gEfiSimpleNetworkProtocolGuid,
+                  (VOID **)&LocalSnp
+                  );
+  ProtocolStatus = Status;
+
+  if (!EFI_ERROR(Status) && (LocalSnp != NULL)) {
+    *Snp = LocalSnp;
+    if (ProviderHandle != NULL) {
+      *ProviderHandle = Handle;
+    }
+  } else {
+    LocalSnp = NULL;
+  }
+
+  LocalController = NULL;
+  ControllerStatus = GetControllerHandleForChildProtocol(
+                       Handle,
+                       &gEfiDhcp4ProtocolGuid,
+                       &LocalController
+                       );
+  if (!EFI_ERROR(ControllerStatus) && (ControllerHandle != NULL)) {
+    *ControllerHandle = LocalController;
+  }
+
+  if (*Snp != NULL) {
+    return EFI_SUCCESS;
+  }
+
+  if (!EFI_ERROR(ControllerStatus) && (LocalController != NULL)) {
+    Status = gBS->HandleProtocol(
+                    LocalController,
+                    &gEfiSimpleNetworkProtocolGuid,
+                    (VOID **)&LocalSnp
+                    );
+    ProtocolStatus = Status;
+    if (!EFI_ERROR(Status) && (LocalSnp != NULL)) {
+      *Snp = LocalSnp;
+      if (ProviderHandle != NULL) {
+        *ProviderHandle = LocalController;
+      }
+      return EFI_SUCCESS;
+    }
+  }
+
+  if (EFI_ERROR(ProtocolStatus)) {
+    return ProtocolStatus;
+  }
+
+  if (EFI_ERROR(ControllerStatus)) {
+    return ControllerStatus;
+  }
+
+  return EFI_DEVICE_ERROR;
+}
+
+STATIC
+EFI_STATUS
+StartSimpleNetworkProtocolInstance(
+  IN EFI_SIMPLE_NETWORK_PROTOCOL *Snp
+  )
+{
+  if (Snp == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (Snp->Mode == NULL) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  EFI_SIMPLE_NETWORK_STATE State = Snp->Mode->State;
+
+  if (State == EfiSimpleNetworkInitialized) {
+    return EFI_SUCCESS;
+  }
+
+  if (State == EfiSimpleNetworkStopped) {
+    if (Snp->Start == NULL) {
+      return EFI_UNSUPPORTED;
+    }
+
+    EFI_STATUS Status = Snp->Start(Snp);
+    if ((Status != EFI_SUCCESS) && (Status != EFI_ALREADY_STARTED)) {
+      return Status;
+    }
+
+    State = Snp->Mode->State;
+  }
+
+  if (State != EfiSimpleNetworkInitialized) {
+    if (Snp->Initialize == NULL) {
+      return EFI_UNSUPPORTED;
+    }
+
+    EFI_STATUS Status = Snp->Initialize(Snp, 0, 0);
+    if ((Status != EFI_SUCCESS) && (Status != EFI_ALREADY_STARTED)) {
+      return Status;
+    }
+
+    State = Snp->Mode->State;
+  }
+
+  if ((State != EfiSimpleNetworkInitialized) && (State != EfiSimpleNetworkStarted)) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+ConnectNetworkController(
+  IN EFI_HANDLE ControllerHandle
+  )
+{
+  if (ControllerHandle == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  EFI_STATUS Status = gBS->ConnectController(
+                          ControllerHandle,
+                          NULL,
+                          NULL,
+                          TRUE
+                          );
+  if (Status == EFI_ALREADY_STARTED) {
+    Status = EFI_SUCCESS;
+  }
+
+  return Status;
+}
+
+STATIC
 VOID
 FreeDhcpHandleBuffer(
   IN EFI_HANDLE *HandleBuffer
@@ -730,68 +937,64 @@ InitializeNicOnHandle(
     return EFI_INVALID_PARAMETER;
   }
 
-  EFI_SIMPLE_NETWORK_PROTOCOL *Snp = NULL;
-  EFI_STATUS                   Status;
+  EFI_SIMPLE_NETWORK_PROTOCOL *Snp             = NULL;
+  EFI_HANDLE                   ProviderHandle  = NULL;
+  EFI_HANDLE                   ControllerHandle = NULL;
 
-  Status = gBS->HandleProtocol(
-                      Handle,
-                      &gEfiSimpleNetworkProtocolGuid,
-                      (VOID **)&Snp
-                      );
-  if (EFI_ERROR(Status) || (Snp == NULL)) {
-    if (!EFI_ERROR(Status)) {
-      Status = EFI_DEVICE_ERROR;
-    }
+  EFI_STATUS Status = OpenSimpleNetworkProtocolForHandle(
+                         Handle,
+                         &Snp,
+                         &ProviderHandle,
+                         &ControllerHandle
+                         );
+  if (EFI_ERROR(Status)) {
     return Status;
   }
 
-  if (Snp->Mode == NULL) {
+  Status = StartSimpleNetworkProtocolInstance(Snp);
+  if (Status != EFI_UNSUPPORTED) {
+    return Status;
+  }
+
+  EFI_HANDLE ConnectHandle = ControllerHandle;
+  if (ConnectHandle == NULL) {
+    ConnectHandle = ProviderHandle;
+  }
+
+  if (ConnectHandle == NULL) {
+    return Status;
+  }
+
+  EFI_STATUS ConnectStatus = ConnectNetworkController(ConnectHandle);
+  if (EFI_ERROR(ConnectStatus)) {
+    return ConnectStatus;
+  }
+
+  EFI_SIMPLE_NETWORK_PROTOCOL *RefreshedSnp = NULL;
+  EFI_STATUS                   ReopenStatus;
+
+  ReopenStatus = EFI_UNSUPPORTED;
+  if (ProviderHandle != NULL) {
+    ReopenStatus = gBS->HandleProtocol(
+                             ProviderHandle,
+                             &gEfiSimpleNetworkProtocolGuid,
+                             (VOID **)&RefreshedSnp
+                             );
+  }
+
+  if (EFI_ERROR(ReopenStatus) || (RefreshedSnp == NULL) || (RefreshedSnp->Mode == NULL)) {
+    ReopenStatus = gBS->HandleProtocol(
+                             ConnectHandle,
+                             &gEfiSimpleNetworkProtocolGuid,
+                             (VOID **)&RefreshedSnp
+                             );
+  }
+
+  if (EFI_ERROR(ReopenStatus) || (RefreshedSnp == NULL)) {
     return EFI_DEVICE_ERROR;
   }
 
-  EFI_SIMPLE_NETWORK_STATE State = Snp->Mode->State;
-
-  if (State == EfiSimpleNetworkInitialized) {
-    return EFI_SUCCESS;
-  }
-
-  if (State == EfiSimpleNetworkStopped) {
-    if (Snp->Start == NULL) {
-      return EFI_UNSUPPORTED;
-    }
-
-    Status = Snp->Start(Snp);
-    if (Status == EFI_ALREADY_STARTED) {
-      Status = EFI_SUCCESS;
-    }
-    if (EFI_ERROR(Status)) {
-      return Status;
-    }
-
-    State = Snp->Mode->State;
-  }
-
-  if (State != EfiSimpleNetworkInitialized) {
-    if (Snp->Initialize == NULL) {
-      return EFI_UNSUPPORTED;
-    }
-
-    Status = Snp->Initialize(Snp, 0, 0);
-    if (Status == EFI_ALREADY_STARTED) {
-      Status = EFI_SUCCESS;
-    }
-    if (EFI_ERROR(Status)) {
-      return Status;
-    }
-
-    State = Snp->Mode->State;
-  }
-
-  if ((State != EfiSimpleNetworkInitialized) && (State != EfiSimpleNetworkStarted)) {
-    return EFI_DEVICE_ERROR;
-  }
-
-  return EFI_SUCCESS;
+  return StartSimpleNetworkProtocolInstance(RefreshedSnp);
 }
 
 STATIC
@@ -836,14 +1039,15 @@ DisplayDhcpInterfaceInformation(
   Print(L"  State: %s (%u)\n", Dhcp4StateToString(ModeData.State), (UINT32)ModeData.State);
 
   UINTN                        MacAddressSize = 0;
-  EFI_SIMPLE_NETWORK_PROTOCOL *Snp            = NULL;
-  Status = gBS->HandleProtocol(
+  EFI_SIMPLE_NETWORK_PROTOCOL *SnpInfo        = NULL;
+  Status = OpenSimpleNetworkProtocolForHandle(
                       Handle,
-                      &gEfiSimpleNetworkProtocolGuid,
-                      (VOID **)&Snp
+                      &SnpInfo,
+                      NULL,
+                      NULL
                       );
-  if (!EFI_ERROR(Status) && (Snp != NULL) && (Snp->Mode != NULL)) {
-    MacAddressSize = Snp->Mode->HwAddressSize;
+  if (!EFI_ERROR(Status) && (SnpInfo != NULL) && (SnpInfo->Mode != NULL)) {
+    MacAddressSize = SnpInfo->Mode->HwAddressSize;
   }
   if ((MacAddressSize == 0) && (ModeData.ReplyPacket != NULL)) {
     MacAddressSize = ModeData.ReplyPacket->Dhcp4.Header.HwAddrLen;
