@@ -721,6 +721,80 @@ LocateDhcp4Handles(
 }
 
 STATIC
+EFI_STATUS
+InitializeNicOnHandle(
+  IN EFI_HANDLE Handle
+  )
+{
+  if (Handle == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  EFI_SIMPLE_NETWORK_PROTOCOL *Snp = NULL;
+  EFI_STATUS                   Status;
+
+  Status = gBS->HandleProtocol(
+                      Handle,
+                      &gEfiSimpleNetworkProtocolGuid,
+                      (VOID **)&Snp
+                      );
+  if (EFI_ERROR(Status) || (Snp == NULL)) {
+    if (!EFI_ERROR(Status)) {
+      Status = EFI_DEVICE_ERROR;
+    }
+    return Status;
+  }
+
+  if (Snp->Mode == NULL) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  EFI_SIMPLE_NETWORK_STATE State = Snp->Mode->State;
+
+  if (State == EfiSimpleNetworkInitialized) {
+    return EFI_SUCCESS;
+  }
+
+  if (State == EfiSimpleNetworkStopped) {
+    if (Snp->Start == NULL) {
+      return EFI_UNSUPPORTED;
+    }
+
+    Status = Snp->Start(Snp);
+    if (Status == EFI_ALREADY_STARTED) {
+      Status = EFI_SUCCESS;
+    }
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+
+    State = Snp->Mode->State;
+  }
+
+  if (State != EfiSimpleNetworkInitialized) {
+    if (Snp->Initialize == NULL) {
+      return EFI_UNSUPPORTED;
+    }
+
+    Status = Snp->Initialize(Snp, 0, 0);
+    if (Status == EFI_ALREADY_STARTED) {
+      Status = EFI_SUCCESS;
+    }
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+
+    State = Snp->Mode->State;
+  }
+
+  if ((State != EfiSimpleNetworkInitialized) && (State != EfiSimpleNetworkStarted)) {
+    return EFI_DEVICE_ERROR;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
 VOID
 DisplayDhcpInterfaceInformation(
   IN EFI_HANDLE Handle,
@@ -732,6 +806,12 @@ DisplayDhcpInterfaceInformation(
   Print(L"DHCPv4 Interface %u\n", (UINT32)(Index + 1));
   Print(L"---------------------\n");
   Print(L"  Handle: %p\n", Handle);
+
+  Status = InitializeNicOnHandle(Handle);
+  if (EFI_ERROR(Status)) {
+    Print(L"  Unable to initialize network interface: %r\n\n", Status);
+    return;
+  }
 
   EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
   Status = gBS->HandleProtocol(
@@ -858,8 +938,12 @@ RenewDhcpLeaseOnHandle(
     *ClientStarted = FALSE;
   }
 
+  EFI_STATUS Status = InitializeNicOnHandle(Handle);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
   EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
-  EFI_STATUS          Status;
 
   Status = gBS->HandleProtocol(
                       Handle,
