@@ -846,11 +846,16 @@ DisplayDhcpInterfaceInformation(
 STATIC
 EFI_STATUS
 RenewDhcpLeaseOnHandle(
-  IN EFI_HANDLE Handle
+  IN  EFI_HANDLE Handle,
+  OUT BOOLEAN    *ClientStarted OPTIONAL
   )
 {
   if (Handle == NULL) {
     return EFI_INVALID_PARAMETER;
+  }
+
+  if (ClientStarted != NULL) {
+    *ClientStarted = FALSE;
   }
 
   EFI_DHCP4_PROTOCOL *Dhcp4 = NULL;
@@ -866,6 +871,57 @@ RenewDhcpLeaseOnHandle(
       Status = EFI_DEVICE_ERROR;
     }
     return Status;
+  }
+
+  EFI_DHCP4_MODE_DATA ModeData;
+  ZeroMem(&ModeData, sizeof(ModeData));
+
+  if (Dhcp4->GetModeData == NULL) {
+    return EFI_UNSUPPORTED;
+  }
+
+  Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  BOOLEAN AttemptedStart = FALSE;
+
+  while (ModeData.State == Dhcp4Stopped) {
+    if (AttemptedStart) {
+      return EFI_DEVICE_ERROR;
+    }
+
+    if (Dhcp4->Start == NULL) {
+      return EFI_UNSUPPORTED;
+    }
+
+    Status = Dhcp4->Start(Dhcp4, NULL);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+
+    AttemptedStart = TRUE;
+    if (ClientStarted != NULL) {
+      *ClientStarted = TRUE;
+    }
+
+    ZeroMem(&ModeData, sizeof(ModeData));
+    Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+  }
+
+  switch (ModeData.State) {
+    case Dhcp4Init:
+    case Dhcp4Selecting:
+    case Dhcp4Requesting:
+    case Dhcp4InitReboot:
+    case Dhcp4Rebooting:
+      return EFI_NOT_READY;
+    default:
+      break;
   }
 
   if (Dhcp4->RenewRebind == NULL) {
@@ -894,11 +950,42 @@ RenewDhcpLeases(
   Print(L"Attempting to renew DHCP lease(s)...\n");
 
   for (UINTN Index = 0; Index < HandleCount; Index++) {
-    EFI_STATUS Status = RenewDhcpLeaseOnHandle(HandleBuffer[Index]);
+    BOOLEAN    ClientStarted = FALSE;
+    EFI_STATUS Status        = RenewDhcpLeaseOnHandle(HandleBuffer[Index], &ClientStarted);
     if (EFI_ERROR(Status)) {
-      Print(L"  Interface %u: Failed to renew DHCP lease: %r\n", (UINT32)(Index + 1), Status);
+      switch (Status) {
+        case EFI_NOT_READY:
+          Print(
+            L"  Interface %u: DHCP client does not have an active lease yet; skipping renewal.\n",
+            (UINT32)(Index + 1)
+            );
+          break;
+        case EFI_UNSUPPORTED:
+          Print(
+            L"  Interface %u: DHCP driver does not support Renew/Rebind operations.\n",
+            (UINT32)(Index + 1)
+            );
+          break;
+        default:
+          Print(
+            L"  Interface %u: Failed to renew DHCP lease: %r\n",
+            (UINT32)(Index + 1),
+            Status
+            );
+          break;
+      }
     } else {
-      Print(L"  Interface %u: DHCP lease renewal requested successfully.\n", (UINT32)(Index + 1));
+      if (ClientStarted) {
+        Print(
+          L"  Interface %u: DHCP client started and lease renewal requested successfully.\n",
+          (UINT32)(Index + 1)
+          );
+      } else {
+        Print(
+          L"  Interface %u: DHCP lease renewal requested successfully.\n",
+          (UINT32)(Index + 1)
+          );
+      }
     }
   }
 
