@@ -674,6 +674,54 @@ PrintDhcpOptions(
 
 STATIC
 VOID
+FreeDhcpHandleBuffer(
+  IN EFI_HANDLE *HandleBuffer
+  )
+{
+  if (HandleBuffer != NULL) {
+    FreePool(HandleBuffer);
+  }
+}
+
+STATIC
+EFI_STATUS
+LocateDhcp4Handles(
+  OUT EFI_HANDLE **HandleBuffer,
+  OUT UINTN      *HandleCount
+  )
+{
+  if ((HandleBuffer == NULL) || (HandleCount == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *HandleBuffer = NULL;
+  *HandleCount  = 0;
+
+  EFI_STATUS Status = gBS->LocateHandleBuffer(
+                             ByProtocol,
+                             &gEfiDhcp4ProtocolGuid,
+                             NULL,
+                             HandleCount,
+                             HandleBuffer
+                             );
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  if ((*HandleBuffer == NULL) || (*HandleCount == 0)) {
+    if (*HandleBuffer != NULL) {
+      FreeDhcpHandleBuffer(*HandleBuffer);
+      *HandleBuffer = NULL;
+    }
+    *HandleCount = 0;
+    return EFI_NOT_FOUND;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+VOID
 DisplayDhcpInterfaceInformation(
   IN EFI_HANDLE Handle,
   IN UINTN      Index
@@ -859,6 +907,45 @@ RenewDhcpLeases(
 
 STATIC
 VOID
+RenewDhcpLeasesFromMenu(
+  VOID
+  )
+{
+  EFI_HANDLE *HandleBuffer = NULL;
+  UINTN       HandleCount  = 0;
+  EFI_STATUS  Status;
+
+  Print(L"Collecting DHCPv4 interfaces...\n\n");
+
+  Status = LocateDhcp4Handles(&HandleBuffer, &HandleCount);
+  if (EFI_ERROR(Status)) {
+    if (Status == EFI_NOT_FOUND) {
+      Print(L"No DHCPv4 interfaces found.\n");
+    } else {
+      Print(L"Unable to locate DHCPv4 handles: %r\n", Status);
+    }
+
+    Print(L"\nPress any key to return to the menu...\n");
+    WaitForKeyPress(NULL);
+    goto Cleanup;
+  }
+
+  RenewDhcpLeases(HandleBuffer, HandleCount);
+
+  Print(L"Updated networking information:\n\n");
+  for (UINTN Index = 0; Index < HandleCount; Index++) {
+    DisplayDhcpInterfaceInformation(HandleBuffer[Index], Index);
+  }
+
+  Print(L"Press any key to return to the menu...\n");
+  WaitForKeyPress(NULL);
+
+Cleanup:
+  FreeDhcpHandleBuffer(HandleBuffer);
+}
+
+STATIC
+VOID
 ShowNetworkInformation(
   VOID
   )
@@ -869,18 +956,12 @@ ShowNetworkInformation(
 
   Print(L"Collecting networking information...\n\n");
 
-  Status = gBS->LocateHandleBuffer(
-                          ByProtocol,
-                          &gEfiDhcp4ProtocolGuid,
-                          NULL,
-                          &HandleCount,
-                          &HandleBuffer
-                          );
-  if (EFI_ERROR(Status) || (HandleBuffer == NULL) || (HandleCount == 0)) {
-    if (EFI_ERROR(Status)) {
-      Print(L"Unable to locate DHCPv4 handles: %r\n", Status);
-    } else {
+  Status = LocateDhcp4Handles(&HandleBuffer, &HandleCount);
+  if (EFI_ERROR(Status)) {
+    if (Status == EFI_NOT_FOUND) {
       Print(L"No DHCPv4 interfaces found.\n");
+    } else {
+      Print(L"Unable to locate DHCPv4 handles: %r\n", Status);
     }
 
     Print(L"\nPress any key to return to the menu...\n");
@@ -911,9 +992,7 @@ ShowNetworkInformation(
   }
 
 Cleanup:
-  if (HandleBuffer != NULL) {
-    FreePool(HandleBuffer);
-  }
+  FreeDhcpHandleBuffer(HandleBuffer);
 }
 
 STATIC
@@ -937,6 +1016,25 @@ FreeHttpHeaders(
   }
 
   FreePool(Headers);
+}
+
+STATIC
+VOID
+ShowJsonPayload(
+  IN CONST CHAR8 *JsonPayload
+  )
+{
+  Print(L"JSON Payload\n");
+  Print(L"------------\n\n");
+
+  if ((JsonPayload == NULL) || (JsonPayload[0] == '\0')) {
+    Print(L"No JSON payload is available.\n\n");
+  } else {
+    Print(L"%a\n\n", JsonPayload);
+  }
+
+  Print(L"Press any key to return to the menu...\n");
+  WaitForKeyPress(NULL);
 }
 
 STATIC
@@ -1414,6 +1512,8 @@ GetMenuSelection(
     Print(L"1. Display QR code\n");
     Print(L"2. Send system information to server\n");
     Print(L"3. Display networking information\n");
+    Print(L"4. Display JSON payload\n");
+    Print(L"5. Renew DHCP lease(s)\n");
     Print(L"Q. Quit\n\n");
     Print(L"Select an option: ");
 
@@ -1425,7 +1525,8 @@ GetMenuSelection(
     }
 
     CHAR16 Value = Key.UnicodeChar;
-    if ((Value == L'1') || (Value == L'2') || (Value == L'3') || (Value == L'Q') || (Value == L'q')) {
+    if ((Value == L'1') || (Value == L'2') || (Value == L'3') || (Value == L'4') ||
+        (Value == L'5') || (Value == L'Q') || (Value == L'q')) {
       *Selection = Value;
       return EFI_SUCCESS;
     }
@@ -1538,6 +1639,14 @@ UefiMain(
 
       case L'3':
         ShowNetworkInformation();
+        break;
+
+      case L'4':
+        ShowJsonPayload(JsonPayload);
+        break;
+
+      case L'5':
+        RenewDhcpLeasesFromMenu();
         break;
 
       case L'Q':
