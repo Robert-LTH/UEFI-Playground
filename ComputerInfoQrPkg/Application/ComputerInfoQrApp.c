@@ -41,6 +41,12 @@ WaitForKeyPress(
   );
 
 STATIC
+EFI_STATUS
+InitializeNicOnHandle(
+  IN EFI_HANDLE Handle
+  );
+
+STATIC
 BOOLEAN
 IsAsciiSpaceCharacter(
   IN CHAR8 Character
