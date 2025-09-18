@@ -49,6 +49,12 @@ InitializeNicOnHandle(
 
 STATIC
 BOOLEAN
+IsValidUuid(
+  IN CONST EFI_GUID *Guid
+  );
+
+STATIC
+BOOLEAN
 IsAsciiSpaceCharacter(
   IN CHAR8 Character
   )
