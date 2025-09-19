@@ -44,6 +44,7 @@
 #define COMPUTER_INFO_QR_SERVER_URL_OPTION  224
 #define DHCP_OPTION_MAX_LENGTH              255
 #define IPV4_STRING_BUFFER_LENGTH           16
+#define SERVER_URL_MAX_LENGTH               512
 
 STATIC BOOLEAN mWaitForKeyPressSupported = TRUE;
 
@@ -51,6 +52,12 @@ STATIC
 EFI_STATUS
 WaitForKeyPress(
   OUT EFI_INPUT_KEY *Key OPTIONAL
+  );
+
+STATIC
+EFI_STATUS
+PromptForServerUrl(
+  OUT CHAR16 **ServerUrl
   );
 
 STATIC
@@ -1918,6 +1925,90 @@ ShowJsonPayload(
 
 STATIC
 EFI_STATUS
+PromptForServerUrl(
+  OUT CHAR16 **ServerUrl
+  )
+{
+  if (ServerUrl == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *ServerUrl = NULL;
+
+  if ((gST == NULL) || (gST->ConIn == NULL)) {
+    return EFI_UNSUPPORTED;
+  }
+
+  Print(L"DHCP did not provide a server URL.\n");
+  Print(L"Enter the server URL manually and press Enter (or press ESC to cancel).\n");
+  Print(L"> ");
+
+  CHAR16     Buffer[SERVER_URL_MAX_LENGTH];
+  EFI_STATUS Status;
+  UINTN      Length = 0;
+
+  ZeroMem(Buffer, sizeof(Buffer));
+
+  while (TRUE) {
+    EFI_INPUT_KEY Key;
+    Status = WaitForKeyPress(&Key);
+    if (EFI_ERROR(Status)) {
+      Print(L"\nUnable to read user input: %r\n", Status);
+      mWaitForKeyPressSupported = FALSE;
+      return Status;
+    }
+
+    if ((Key.UnicodeChar == CHAR_CARRIAGE_RETURN) || (Key.UnicodeChar == CHAR_LINEFEED)) {
+      Print(L"\n");
+      break;
+    }
+
+    if (Key.UnicodeChar == CHAR_BACKSPACE) {
+      if (Length > 0) {
+        Length--;
+        Buffer[Length] = L'\0';
+        Print(L"\b \b");
+      }
+      continue;
+    }
+
+    if ((Key.UnicodeChar == 0) && (Key.ScanCode == SCAN_ESC)) {
+      Print(L"\n");
+      return EFI_ABORTED;
+    }
+
+    if ((Key.UnicodeChar < L' ') && (Key.UnicodeChar != 0)) {
+      continue;
+    }
+
+    if (Length >= (SERVER_URL_MAX_LENGTH - 1)) {
+      Print(L"\a");
+      continue;
+    }
+
+    Buffer[Length++] = Key.UnicodeChar;
+    Print(L"%c", Key.UnicodeChar);
+  }
+
+  if (Length == 0) {
+    return EFI_ABORTED;
+  }
+
+  CHAR16 *Allocated = AllocateZeroPool((Length + 1) * sizeof(CHAR16));
+  if (Allocated == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  CopyMem(Allocated, Buffer, Length * sizeof(CHAR16));
+  Allocated[Length] = L'\0';
+
+  *ServerUrl = Allocated;
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
 PostSystemInfoToServer(
   IN CONST CHAR8 *JsonPayload,
   IN UINTN        PayloadLength
@@ -1929,9 +2020,25 @@ PostSystemInfoToServer(
 
   CHAR16 *ServerUrl = NULL;
   EFI_STATUS Status = GetServerUrlFromDhcp(&ServerUrl);
-  if (EFI_ERROR(Status)) {
+  if (Status == EFI_NOT_FOUND) {
+    Print(L"DHCP server URL option was not provided.\n");
+    Status = PromptForServerUrl(&ServerUrl);
+    if (EFI_ERROR(Status)) {
+      if (Status == EFI_ABORTED) {
+        Print(L"Manual server URL entry canceled by user.\n");
+      } else {
+        Print(L"Unable to obtain server URL: %r\n", Status);
+      }
+      return Status;
+    }
+  } else if (EFI_ERROR(Status)) {
     Print(L"Unable to retrieve server URL from DHCP: %r\n", Status);
     return Status;
+  }
+
+  if (ServerUrl == NULL) {
+    Print(L"Server URL is empty.\n");
+    return EFI_NOT_FOUND;
   }
 
   Print(L"Using server URL: %s\n", ServerUrl);
