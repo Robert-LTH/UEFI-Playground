@@ -2018,26 +2018,38 @@ PostSystemInfoToServer(
     return EFI_INVALID_PARAMETER;
   }
 
-  CHAR16 *ServerUrl = NULL;
-  EFI_STATUS Status = GetServerUrlFromDhcp(&ServerUrl);
-  if (Status == EFI_NOT_FOUND) {
-    Print(L"DHCP server URL option was not provided.\n");
-    Status = PromptForServerUrl(&ServerUrl);
-    if (EFI_ERROR(Status)) {
-      if (Status == EFI_ABORTED) {
+  CHAR16     *ServerUrl = NULL;
+  EFI_STATUS  Status    = GetServerUrlFromDhcp(&ServerUrl);
+  if (EFI_ERROR(Status) || (ServerUrl == NULL) || (ServerUrl[0] == L'\0')) {
+    if (Status == EFI_NOT_FOUND) {
+      Print(L"DHCP server URL option was not provided.\n");
+    } else if (EFI_ERROR(Status)) {
+      Print(L"Unable to retrieve server URL from DHCP: %r\n", Status);
+    } else {
+      Print(L"DHCP provided an empty server URL.\n");
+    }
+
+    if (ServerUrl != NULL) {
+      FreePool(ServerUrl);
+      ServerUrl = NULL;
+    }
+
+    EFI_STATUS PromptStatus = PromptForServerUrl(&ServerUrl);
+    if (EFI_ERROR(PromptStatus)) {
+      if (PromptStatus == EFI_ABORTED) {
         Print(L"Manual server URL entry canceled by user.\n");
       } else {
-        Print(L"Unable to obtain server URL: %r\n", Status);
+        Print(L"Unable to obtain server URL: %r\n", PromptStatus);
       }
-      return Status;
+      return PromptStatus;
     }
-  } else if (EFI_ERROR(Status)) {
-    Print(L"Unable to retrieve server URL from DHCP: %r\n", Status);
-    return Status;
   }
 
-  if (ServerUrl == NULL) {
+  if ((ServerUrl == NULL) || (ServerUrl[0] == L'\0')) {
     Print(L"Server URL is empty.\n");
+    if (ServerUrl != NULL) {
+      FreePool(ServerUrl);
+    }
     return EFI_NOT_FOUND;
   }
 
