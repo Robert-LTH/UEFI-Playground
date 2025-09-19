@@ -5,11 +5,19 @@
 
 #define QR_VERSION                    COMPUTER_INFO_QR_VERSION
 #define QR_SIZE_PIXELS                COMPUTER_INFO_QR_SIZE
-#define QR_DATA_CODEWORDS             108
-#define QR_ECC_CODEWORDS              26
-#define QR_TOTAL_CODEWORDS            134
-#define QR_REMAINDER_BITS             7
+#define QR_DATA_CODEWORDS             156
+#define QR_ECC_CODEWORDS              40
+#define QR_TOTAL_CODEWORDS            196
+#define QR_REMAINDER_BITS             0
 #define QR_DATA_BIT_CAPACITY          (QR_DATA_CODEWORDS * 8)
+
+#define QR_NUM_BLOCKS                 2
+#define QR_BLOCK_DATA_CODEWORDS       78
+#define QR_BLOCK_ECC_CODEWORDS        20
+#define QR_VERSION_INFORMATION        0x07C94
+
+STATIC CONST UINT8 mAlignmentPatternCenters[] = { 6, 22, 38 };
+#define QR_ALIGNMENT_PATTERN_COUNT    (sizeof(mAlignmentPatternCenters) / sizeof(mAlignmentPatternCenters[0]))
 
 #define GF_SIZE                       256
 #define GF_GENERATOR_POLYNOMIAL       0x11D
@@ -235,6 +243,41 @@ ComputeReedSolomon(
 
 STATIC
 VOID
+BuildCodewordSequence(
+  IN  CONST UINT8 *DataCodewords,
+  OUT UINT8       *Codewords
+  )
+{
+  UINT8 DataBlocks[QR_NUM_BLOCKS][QR_BLOCK_DATA_CODEWORDS];
+  UINT8 ParityBlocks[QR_NUM_BLOCKS][QR_BLOCK_ECC_CODEWORDS];
+
+  for (UINTN Block = 0; Block < QR_NUM_BLOCKS; Block++) {
+    CONST UINT8 *Source = DataCodewords + (Block * QR_BLOCK_DATA_CODEWORDS);
+    CopyMem(DataBlocks[Block], Source, QR_BLOCK_DATA_CODEWORDS);
+    ComputeReedSolomon(
+      DataBlocks[Block],
+      QR_BLOCK_DATA_CODEWORDS,
+      ParityBlocks[Block],
+      QR_BLOCK_ECC_CODEWORDS
+      );
+  }
+
+  UINTN Index = 0;
+  for (UINTN Offset = 0; Offset < QR_BLOCK_DATA_CODEWORDS; Offset++) {
+    for (UINTN Block = 0; Block < QR_NUM_BLOCKS; Block++) {
+      Codewords[Index++] = DataBlocks[Block][Offset];
+    }
+  }
+
+  for (UINTN Offset = 0; Offset < QR_BLOCK_ECC_CODEWORDS; Offset++) {
+    for (UINTN Block = 0; Block < QR_NUM_BLOCKS; Block++) {
+      Codewords[Index++] = ParityBlocks[Block][Offset];
+    }
+  }
+}
+
+STATIC
+VOID
 DrawFinderPattern(
   IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
   IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
@@ -299,6 +342,35 @@ DrawAlignmentPattern(
       UINT8 Value = (UINT8)((Distance != 1) ? 1 : 0);
       Modules[PosY][PosX] = (INT8)Value;
       FunctionModules[PosY][PosX] = TRUE;
+    }
+  }
+}
+
+STATIC
+VOID
+DrawAlignmentPatterns(
+  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
+  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  )
+{
+  if (QR_ALIGNMENT_PATTERN_COUNT == 0) {
+    return;
+  }
+
+  UINT8 LastCenter = mAlignmentPatternCenters[QR_ALIGNMENT_PATTERN_COUNT - 1];
+
+  for (UINTN YIndex = 0; YIndex < QR_ALIGNMENT_PATTERN_COUNT; YIndex++) {
+    for (UINTN XIndex = 0; XIndex < QR_ALIGNMENT_PATTERN_COUNT; XIndex++) {
+      UINT8 CenterX = mAlignmentPatternCenters[XIndex];
+      UINT8 CenterY = mAlignmentPatternCenters[YIndex];
+
+      if (((CenterX == 6) && (CenterY == 6)) ||
+          ((CenterX == 6) && (CenterY == LastCenter)) ||
+          ((CenterX == LastCenter) && (CenterY == 6))) {
+        continue;
+      }
+
+      DrawAlignmentPattern(Modules, FunctionModules, CenterX, CenterY);
     }
   }
 }
@@ -515,6 +587,42 @@ DrawFormatBits(
 }
 
 STATIC
+VOID
+DrawVersionInformation(
+  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
+  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  )
+{
+  if (QR_VERSION < 7) {
+    return;
+  }
+
+  UINT32 VersionInfo = QR_VERSION_INFORMATION;
+
+  for (UINTN Index = 0; Index < 6; Index++) {
+    UINT8 Bit0 = (UINT8)((VersionInfo >> (Index * 3)) & 0x1);
+    UINT8 Bit1 = (UINT8)((VersionInfo >> ((Index * 3) + 1)) & 0x1);
+    UINT8 Bit2 = (UINT8)((VersionInfo >> ((Index * 3) + 2)) & 0x1);
+
+    INTN BottomRow = (INTN)QR_SIZE_PIXELS - 11;
+    Modules[BottomRow][Index] = (INT8)Bit0;
+    FunctionModules[BottomRow][Index] = TRUE;
+    Modules[BottomRow + 1][Index] = (INT8)Bit1;
+    FunctionModules[BottomRow + 1][Index] = TRUE;
+    Modules[BottomRow + 2][Index] = (INT8)Bit2;
+    FunctionModules[BottomRow + 2][Index] = TRUE;
+
+    INTN RightColumn = (INTN)QR_SIZE_PIXELS - 11;
+    Modules[Index][RightColumn] = (INT8)Bit0;
+    FunctionModules[Index][RightColumn] = TRUE;
+    Modules[Index][RightColumn + 1] = (INT8)Bit1;
+    FunctionModules[Index][RightColumn + 1] = TRUE;
+    Modules[Index][RightColumn + 2] = (INT8)Bit2;
+    FunctionModules[Index][RightColumn + 2] = TRUE;
+  }
+}
+
+STATIC
 INT32
 ScoreRunPenalty(
   IN INT8 Line[QR_SIZE_PIXELS]
@@ -640,12 +748,8 @@ GenerateComputerInfoQrCode(
     return Status;
   }
 
-  UINT8 EccCodewords[QR_ECC_CODEWORDS];
-  ComputeReedSolomon(DataCodewords, QR_DATA_CODEWORDS, EccCodewords, QR_ECC_CODEWORDS);
-
   UINT8 Codewords[QR_TOTAL_CODEWORDS];
-  CopyMem(Codewords, DataCodewords, QR_DATA_CODEWORDS);
-  CopyMem(Codewords + QR_DATA_CODEWORDS, EccCodewords, QR_ECC_CODEWORDS);
+  BuildCodewordSequence(DataCodewords, Codewords);
 
   UINTN TotalDataBits = QR_TOTAL_CODEWORDS * 8 + QR_REMAINDER_BITS;
   UINT8 DataBits[QR_TOTAL_CODEWORDS * 8 + QR_REMAINDER_BITS];
@@ -672,9 +776,10 @@ GenerateComputerInfoQrCode(
 
   DrawTimingPatterns(BaseModules, FunctionModules);
 
-  DrawAlignmentPattern(BaseModules, FunctionModules, QR_SIZE_PIXELS - 7, QR_SIZE_PIXELS - 7);
+  DrawAlignmentPatterns(BaseModules, FunctionModules);
 
   ReserveFormatInfo(FunctionModules);
+  DrawVersionInformation(BaseModules, FunctionModules);
 
   BaseModules[QR_SIZE_PIXELS - 8][8] = 1;
   FunctionModules[QR_SIZE_PIXELS - 8][8] = TRUE;

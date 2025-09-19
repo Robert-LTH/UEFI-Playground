@@ -3,9 +3,9 @@
 
 #include <Uefi.h>
 
-#define COMPUTER_INFO_QR_VERSION             5
+#define COMPUTER_INFO_QR_VERSION             7
 #define COMPUTER_INFO_QR_SIZE                (4 * COMPUTER_INFO_QR_VERSION + 17)
-#define COMPUTER_INFO_QR_MAX_DATA_LENGTH     108
+#define COMPUTER_INFO_QR_MAX_DATA_LENGTH     156
 
 typedef struct {
   UINTN Size;
