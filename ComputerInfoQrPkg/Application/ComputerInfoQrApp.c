@@ -20,7 +20,6 @@
 #include "QrCode.h"
 
 #define QUIET_ZONE_SIZE                 2
-#define INFO_BUFFER_LENGTH              (COMPUTER_INFO_QR_MAX_DATA_LENGTH + 1)
 #define JSON_PAYLOAD_BUFFER_LENGTH      1024
 #define HARDWARE_MODEL_BUFFER_LENGTH    128
 #define HARDWARE_SIZE_BUFFER_LENGTH     64
@@ -2672,28 +2671,6 @@ UefiMain(
     AsciiStrCpyS(MacString, sizeof(MacString), UNKNOWN_STRING);
   }
 
-  UINTN SerialLength = AsciiStrLen(SerialNumber);
-  UINTN UuidLength   = AsciiStrLen(UuidString);
-  UINTN MacLength    = AsciiStrLen(MacString);
-  if ((UuidLength + 1 + MacLength + 1 + SerialLength) > COMPUTER_INFO_QR_MAX_DATA_LENGTH) {
-    Print(L"Encoded data is too large for the selected QR code size.\n");
-    return EFI_BAD_BUFFER_SIZE;
-  }
-
-  CHAR8 InfoBuffer[INFO_BUFFER_LENGTH];
-  AsciiSPrint(InfoBuffer, sizeof(InfoBuffer), "%a|%a|%a", UuidString, MacString, SerialNumber);
-  UINTN DataLength = AsciiStrLen(InfoBuffer);
-  if ((DataLength == 0) || (DataLength > COMPUTER_INFO_QR_MAX_DATA_LENGTH)) {
-    return EFI_BAD_BUFFER_SIZE;
-  }
-
-  COMPUTER_INFO_QR_CODE QrCode;
-  EFI_STATUS            Status = GenerateComputerInfoQrCode((CONST UINT8 *)InfoBuffer, DataLength, &QrCode);
-  if (EFI_ERROR(Status)) {
-    Print(L"QR code generation failed: %r\n", Status);
-    return Status;
-  }
-
   CHAR8 CpuModel[HARDWARE_MODEL_BUFFER_LENGTH];
   CHAR8 CpuSize[HARDWARE_SIZE_BUFFER_LENGTH];
   CHAR8 BoardModel[HARDWARE_MODEL_BUFFER_LENGTH];
@@ -2706,19 +2683,19 @@ UefiMain(
   GetMemoryInfo(MemoryModel, sizeof(MemoryModel), MemorySize, sizeof(MemorySize));
 
   CHAR8 JsonPayload[JSON_PAYLOAD_BUFFER_LENGTH];
-  Status = BuildJsonPayload(
-             JsonPayload,
-             sizeof(JsonPayload),
-             UuidString,
-             MacString,
-             SerialNumber,
-             CpuModel,
-             CpuSize,
-             BoardModel,
-             BoardSize,
-             MemoryModel,
-             MemorySize
-             );
+  EFI_STATUS Status = BuildJsonPayload(
+                       JsonPayload,
+                       sizeof(JsonPayload),
+                       UuidString,
+                       MacString,
+                       SerialNumber,
+                       CpuModel,
+                       CpuSize,
+                       BoardModel,
+                       BoardSize,
+                       MemoryModel,
+                       MemorySize
+                       );
   if (EFI_ERROR(Status)) {
     Print(L"Failed to build JSON payload: %r\n", Status);
     return Status;
@@ -2728,6 +2705,18 @@ UefiMain(
   if (JsonLength == 0) {
     Print(L"JSON payload is empty.\n");
     return EFI_DEVICE_ERROR;
+  }
+
+  if (JsonLength > COMPUTER_INFO_QR_MAX_DATA_LENGTH) {
+    Print(L"JSON payload is too large for the selected QR code size.\n");
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  COMPUTER_INFO_QR_CODE QrCode;
+  Status = GenerateComputerInfoQrCode((CONST UINT8 *)JsonPayload, JsonLength, &QrCode);
+  if (EFI_ERROR(Status)) {
+    Print(L"QR code generation failed: %r\n", Status);
+    return Status;
   }
 
   EFI_STATUS ReturnStatus   = EFI_SUCCESS;
@@ -2748,7 +2737,6 @@ UefiMain(
     switch (Selection) {
       case L'1':
         ShowQrScreen(&QrCode);
-        Print(L"\nPress any key to return to the menu...\n");
         WaitForKeyPress(NULL);
         break;
 
