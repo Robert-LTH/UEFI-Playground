@@ -20,7 +20,7 @@
 #include "QrCode.h"
 
 #define QUIET_ZONE_SIZE                 2
-#define JSON_PAYLOAD_BUFFER_LENGTH      1024
+#define JSON_PAYLOAD_BUFFER_LENGTH      (COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH + 1)
 #define HARDWARE_MODEL_BUFFER_LENGTH    128
 #define HARDWARE_SIZE_BUFFER_LENGTH     64
 #define UUID_STRING_LENGTH              36
@@ -28,7 +28,7 @@
 #define MAC_ADDRESS_MAX_BYTES           32
 #define MAC_STRING_MAX_LENGTH           (MAC_ADDRESS_MAX_BYTES * 2)
 #define MAC_STRING_BUFFER_LENGTH        (MAC_STRING_MAX_LENGTH + 1)
-#define SERIAL_NUMBER_BUFFER_LENGTH     (COMPUTER_INFO_QR_MAX_DATA_LENGTH + 1)
+#define SERIAL_NUMBER_BUFFER_LENGTH     (COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH + 1)
 #define UNKNOWN_STRING                  "UNKNOWN"
 #define DHCP_OPTION_PAD                 0
 #define DHCP_OPTION_SUBNET_MASK         1
@@ -2370,7 +2370,7 @@ RenderQuietRow(
   )
 {
   UINTN Characters = TotalModules * 2;
-  CHAR16 RowBuffer[(COMPUTER_INFO_QR_SIZE + (QUIET_ZONE_SIZE * 2)) * 2 + 1];
+  CHAR16 RowBuffer[(COMPUTER_INFO_QR_MAX_SIZE + (QUIET_ZONE_SIZE * 2)) * 2 + 1];
 
   for (UINTN Index = 0; Index < Characters; Index++) {
     RowBuffer[Index] = L' ';
@@ -2386,7 +2386,7 @@ RenderQrRow(
   IN UINTN                        RowIndex
   )
 {
-  CHAR16 RowBuffer[(COMPUTER_INFO_QR_SIZE + (QUIET_ZONE_SIZE * 2)) * 2 + 1];
+  CHAR16 RowBuffer[(COMPUTER_INFO_QR_MAX_SIZE + (QUIET_ZONE_SIZE * 2)) * 2 + 1];
   UINTN  Position = 0;
 
   for (UINTN Index = 0; Index < QUIET_ZONE_SIZE; Index++) {
@@ -2707,7 +2707,7 @@ UefiMain(
     return EFI_DEVICE_ERROR;
   }
 
-  if (JsonLength > COMPUTER_INFO_QR_MAX_DATA_LENGTH) {
+  if (JsonLength > COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH) {
     Print(L"JSON payload is too large for the selected QR code size.\n");
     return EFI_BAD_BUFFER_SIZE;
   }

@@ -3,29 +3,27 @@
 #include <Library/BaseMemoryLib.h>
 #include <Library/BaseLib.h>
 
-#define QR_VERSION                    COMPUTER_INFO_QR_VERSION
-#define QR_SIZE_PIXELS                COMPUTER_INFO_QR_SIZE
-#define QR_DATA_CODEWORDS             156
-#define QR_ECC_CODEWORDS              40
-#define QR_TOTAL_CODEWORDS            196
-#define QR_REMAINDER_BITS             0
-#define QR_DATA_BIT_CAPACITY          (QR_DATA_CODEWORDS * 8)
-
-#define QR_NUM_BLOCKS                 2
-#define QR_BLOCK_DATA_CODEWORDS       78
-#define QR_BLOCK_ECC_CODEWORDS        20
-#define QR_VERSION_INFORMATION        0x07C94
-
-STATIC CONST UINT8 mAlignmentPatternCenters[] = { 6, 22, 38 };
-#define QR_ALIGNMENT_PATTERN_COUNT    (sizeof(mAlignmentPatternCenters) / sizeof(mAlignmentPatternCenters[0]))
-
 #define GF_SIZE                       256
 #define GF_GENERATOR_POLYNOMIAL       0x11D
 
+#define QR_MAX_ALIGNMENT_PATTERN_COUNT  ((COMPUTER_INFO_QR_MAX_VERSION / 7) + 2)
+
 typedef struct {
-  UINT8 Bytes[QR_DATA_CODEWORDS];
+  UINT8 Bytes[COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH];
   UINTN BitLength;
+  UINTN CapacityBytes;
 } QR_BIT_BUFFER;
+
+typedef INT8    QR_MODULE_MATRIX[COMPUTER_INFO_QR_MAX_SIZE][COMPUTER_INFO_QR_MAX_SIZE];
+typedef BOOLEAN QR_FUNCTION_MATRIX[COMPUTER_INFO_QR_MAX_SIZE][COMPUTER_INFO_QR_MAX_SIZE];
+
+STATIC CONST UINT8 mEccCodewordsPerBlock[COMPUTER_INFO_QR_MAX_VERSION + 1] = {
+  0,  7, 10, 15, 20, 26, 18, 20, 24, 30, 18, 20, 24, 26, 30, 22, 24, 28, 30, 28, 28, 28, 28, 30
+};
+
+STATIC CONST UINT8 mNumErrorCorrectionBlocks[COMPUTER_INFO_QR_MAX_VERSION + 1] = {
+  0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4, 4, 6, 6, 6, 6, 7, 8, 8, 9, 9
+};
 
 STATIC UINT8   mGaloisExpTable[GF_SIZE * 2];
 STATIC UINT8   mGaloisLogTable[GF_SIZE];
@@ -83,13 +81,166 @@ GaloisPowerOfTwo(
 }
 
 STATIC
+UINTN
+GetNumRawDataModules(
+  IN UINTN Version
+  )
+{
+  if ((Version == 0) || (Version > COMPUTER_INFO_QR_MAX_VERSION)) {
+    return 0;
+  }
+
+  UINTN Result = (16 * Version + 128) * Version + 64;
+  if (Version >= 2) {
+    UINTN NumAlign = Version / 7 + 2;
+    Result -= (25 * NumAlign - 10) * NumAlign - 55;
+    if (Version >= 7) {
+      Result -= 36;
+    }
+  }
+
+  return Result;
+}
+
+STATIC
+UINTN
+GetTotalCodewords(
+  IN UINTN Version
+  )
+{
+  return GetNumRawDataModules(Version) / 8;
+}
+
+STATIC
+UINTN
+GetRemainderBits(
+  IN UINTN Version
+  )
+{
+  return GetNumRawDataModules(Version) % 8;
+}
+
+STATIC
+UINTN
+GetEccCodewordsPerBlock(
+  IN UINTN Version
+  )
+{
+  if (Version > COMPUTER_INFO_QR_MAX_VERSION) {
+    return 0;
+  }
+  return mEccCodewordsPerBlock[Version];
+}
+
+STATIC
+UINTN
+GetNumErrorCorrectionBlocks(
+  IN UINTN Version
+  )
+{
+  if (Version > COMPUTER_INFO_QR_MAX_VERSION) {
+    return 0;
+  }
+  return mNumErrorCorrectionBlocks[Version];
+}
+
+STATIC
+UINTN
+GetDataCodewordCapacity(
+  IN UINTN Version
+  )
+{
+  UINTN Total = GetTotalCodewords(Version);
+  UINTN EccPerBlock = GetEccCodewordsPerBlock(Version);
+  UINTN NumBlocks = GetNumErrorCorrectionBlocks(Version);
+  if ((Total == 0) || (EccPerBlock == 0) || (NumBlocks == 0)) {
+    return 0;
+  }
+
+  return Total - (EccPerBlock * NumBlocks);
+}
+
+STATIC
+VOID
+GetAlignmentPatternCenters(
+  IN  UINTN Version,
+  OUT UINT8 *Centers,
+  OUT UINTN *Count
+  )
+{
+  if ((Centers == NULL) || (Count == NULL)) {
+    return;
+  }
+
+  if ((Version == 0) || (Version > COMPUTER_INFO_QR_MAX_VERSION)) {
+    *Count = 0;
+    return;
+  }
+
+  if (Version == 1) {
+    *Count = 0;
+    return;
+  }
+
+  UINTN Size = 4 * Version + 17;
+  UINTN NumAlign = Version / 7 + 2;
+  UINTN Step = ((Version * 8) + (NumAlign * 3) + 5) / ((NumAlign * 4) - 4);
+  Step *= 2;
+
+  UINT8 TempCenters[QR_MAX_ALIGNMENT_PATTERN_COUNT];
+  UINTN Index = 0;
+  UINTN Position = Size - 7;
+  for (UINTN CountIndex = 0; CountIndex < NumAlign - 1; CountIndex++) {
+    if (Index < QR_MAX_ALIGNMENT_PATTERN_COUNT) {
+      TempCenters[Index] = (UINT8)Position;
+    }
+    Index++;
+    Position -= Step;
+  }
+
+  Centers[0] = 6;
+  for (UINTN OutputIndex = 0; OutputIndex < Index; OutputIndex++) {
+    UINTN SourceIndex = Index - 1 - OutputIndex;
+    if ((OutputIndex + 1) < QR_MAX_ALIGNMENT_PATTERN_COUNT) {
+      Centers[OutputIndex + 1] = TempCenters[SourceIndex];
+    }
+  }
+
+  *Count = Index + 1;
+}
+
+STATIC
+UINT32
+ComputeVersionInformation(
+  IN UINTN Version
+  )
+{
+  if (Version < 7) {
+    return 0;
+  }
+
+  UINT32 Remainder = (UINT32)Version;
+  for (UINTN Index = 0; Index < 12; Index++) {
+    if ((Remainder >> 11) & 0x1) {
+      Remainder = (Remainder << 1) ^ 0x1F25;
+    } else {
+      Remainder <<= 1;
+    }
+  }
+
+  return ((UINT32)Version << 12) | (Remainder & 0xFFF);
+}
+
+STATIC
 VOID
 BitBufferInit(
-  OUT QR_BIT_BUFFER *Buffer
+  OUT QR_BIT_BUFFER *Buffer,
+  IN  UINTN          CapacityBytes
   )
 {
   ZeroMem(Buffer->Bytes, sizeof(Buffer->Bytes));
   Buffer->BitLength = 0;
+  Buffer->CapacityBytes = CapacityBytes;
 }
 
 STATIC
@@ -110,7 +261,7 @@ BitBufferAppendBits(
 
   for (INTN Bit = (INTN)Count - 1; Bit >= 0; Bit--) {
     UINTN ByteIndex = Buffer->BitLength / 8;
-    if (ByteIndex >= QR_DATA_CODEWORDS) {
+    if (ByteIndex >= Buffer->CapacityBytes) {
       return EFI_BUFFER_TOO_SMALL;
     }
 
@@ -128,15 +279,19 @@ EFI_STATUS
 BuildDataCodewords(
   IN  CONST UINT8 *Payload,
   IN  UINTN        PayloadLength,
-  OUT UINT8       *Codewords
+  OUT UINT8       *Codewords,
+  IN  UINTN        DataCapacity
   )
 {
-  if (PayloadLength > COMPUTER_INFO_QR_MAX_DATA_LENGTH) {
+  if ((PayloadLength > DataCapacity) || (DataCapacity == 0) ||
+      (DataCapacity > COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH)) {
     return EFI_BAD_BUFFER_SIZE;
   }
 
   QR_BIT_BUFFER Buffer;
-  BitBufferInit(&Buffer);
+  BitBufferInit(&Buffer, DataCapacity);
+
+  UINTN DataBitCapacity = DataCapacity * 8;
 
   EFI_STATUS Status;
 
@@ -157,11 +312,11 @@ BuildDataCodewords(
     }
   }
 
-  if (Buffer.BitLength > QR_DATA_BIT_CAPACITY) {
+  if (Buffer.BitLength > DataBitCapacity) {
     return EFI_BAD_BUFFER_SIZE;
   }
 
-  UINTN RemainingBits = QR_DATA_BIT_CAPACITY - Buffer.BitLength;
+  UINTN RemainingBits = DataBitCapacity - Buffer.BitLength;
   UINTN TerminatorBits = (RemainingBits < 4) ? RemainingBits : 4;
 
   Status = BitBufferAppendBits(&Buffer, 0, TerminatorBits);
@@ -177,7 +332,7 @@ BuildDataCodewords(
   }
 
   BOOLEAN Toggle = TRUE;
-  while (Buffer.BitLength < QR_DATA_BIT_CAPACITY) {
+  while (Buffer.BitLength < DataBitCapacity) {
     UINT8 Pad = Toggle ? 0xEC : 0x11;
     Status = BitBufferAppendBits(&Buffer, Pad, 8);
     if (EFI_ERROR(Status)) {
@@ -186,7 +341,7 @@ BuildDataCodewords(
     Toggle = !Toggle;
   }
 
-  CopyMem(Codewords, Buffer.Bytes, QR_DATA_CODEWORDS);
+  CopyMem(Codewords, Buffer.Bytes, DataCapacity);
   return EFI_SUCCESS;
 }
 
@@ -222,7 +377,7 @@ ComputeReedSolomon(
 {
   SetMem(Parity, ParityCount * sizeof(UINT8), 0);
 
-  UINT8 Generator[QR_ECC_CODEWORDS + 1];
+  UINT8 Generator[COMPUTER_INFO_QR_MAX_ECC_CODEWORDS_PER_BLOCK + 1];
   ComputeGeneratorPolynomial(ParityCount, Generator);
 
   for (UINTN Index = 0; Index < DataCount; Index++) {
@@ -242,54 +397,112 @@ ComputeReedSolomon(
 }
 
 STATIC
-VOID
+EFI_STATUS
 BuildCodewordSequence(
   IN  CONST UINT8 *DataCodewords,
+  IN  UINTN        DataCodewordCount,
+  IN  UINTN        TotalCodewords,
+  IN  UINTN        NumBlocks,
+  IN  UINTN        EccCodewordsPerBlock,
   OUT UINT8       *Codewords
   )
 {
-  UINT8 DataBlocks[QR_NUM_BLOCKS][QR_BLOCK_DATA_CODEWORDS];
-  UINT8 ParityBlocks[QR_NUM_BLOCKS][QR_BLOCK_ECC_CODEWORDS];
+  if ((DataCodewords == NULL) || (Codewords == NULL) ||
+      (NumBlocks == 0) || (EccCodewordsPerBlock == 0) ||
+      (NumBlocks > COMPUTER_INFO_QR_MAX_ERROR_CORRECTION_BLOCKS) ||
+      (EccCodewordsPerBlock > COMPUTER_INFO_QR_MAX_ECC_CODEWORDS_PER_BLOCK) ||
+      (TotalCodewords > COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS) ||
+      (DataCodewordCount > COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH)) {
+    return EFI_INVALID_PARAMETER;
+  }
 
-  for (UINTN Block = 0; Block < QR_NUM_BLOCKS; Block++) {
-    CONST UINT8 *Source = DataCodewords + (Block * QR_BLOCK_DATA_CODEWORDS);
-    CopyMem(DataBlocks[Block], Source, QR_BLOCK_DATA_CODEWORDS);
+  UINTN RawCodewords = TotalCodewords;
+  UINTN NumLongBlocks = RawCodewords % NumBlocks;
+  UINTN NumShortBlocks = NumBlocks - NumLongBlocks;
+  UINTN ShortBlockTotalLength = RawCodewords / NumBlocks;
+  UINTN LongBlockTotalLength = ShortBlockTotalLength + ((NumLongBlocks > 0) ? 1 : 0);
+
+  if (ShortBlockTotalLength < EccCodewordsPerBlock) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  UINTN ShortBlockDataLength = ShortBlockTotalLength - EccCodewordsPerBlock;
+  UINTN LongBlockDataLength = LongBlockTotalLength - EccCodewordsPerBlock;
+
+  UINTN ExpectedDataCodewords = (ShortBlockDataLength * NumShortBlocks) + (LongBlockDataLength * NumLongBlocks);
+  if (ExpectedDataCodewords != DataCodewordCount) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  UINT8 Blocks[COMPUTER_INFO_QR_MAX_ERROR_CORRECTION_BLOCKS][COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS];
+  UINTN BlockLengths[COMPUTER_INFO_QR_MAX_ERROR_CORRECTION_BLOCKS];
+
+  UINTN Offset = 0;
+  for (UINTN BlockIndex = 0; BlockIndex < NumBlocks; BlockIndex++) {
+    BOOLEAN IsShortBlock = (BlockIndex < NumShortBlocks);
+    UINTN   DataLength   = IsShortBlock ? ShortBlockDataLength : LongBlockDataLength;
+
+    CopyMem(Blocks[BlockIndex], DataCodewords + Offset, DataLength);
+    Offset += DataLength;
+
+    UINT8 Parity[COMPUTER_INFO_QR_MAX_ECC_CODEWORDS_PER_BLOCK];
     ComputeReedSolomon(
-      DataBlocks[Block],
-      QR_BLOCK_DATA_CODEWORDS,
-      ParityBlocks[Block],
-      QR_BLOCK_ECC_CODEWORDS
+      Blocks[BlockIndex],
+      DataLength,
+      Parity,
+      EccCodewordsPerBlock
       );
+
+    UINTN InsertIndex = DataLength;
+    if (IsShortBlock) {
+      Blocks[BlockIndex][InsertIndex++] = 0;
+    }
+
+    CopyMem(&Blocks[BlockIndex][InsertIndex], Parity, EccCodewordsPerBlock);
+    BlockLengths[BlockIndex] = InsertIndex + EccCodewordsPerBlock;
   }
 
-  UINTN Index = 0;
-  for (UINTN Offset = 0; Offset < QR_BLOCK_DATA_CODEWORDS; Offset++) {
-    for (UINTN Block = 0; Block < QR_NUM_BLOCKS; Block++) {
-      Codewords[Index++] = DataBlocks[Block][Offset];
+  if (Offset != DataCodewordCount) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  UINTN BlockLength = BlockLengths[0];
+  UINTN CodewordIndex = 0;
+
+  for (UINTN Index = 0; Index < BlockLength; Index++) {
+    for (UINTN BlockIndex = 0; BlockIndex < NumBlocks; BlockIndex++) {
+      if ((BlockIndex < NumShortBlocks) && (Index == ShortBlockDataLength)) {
+        continue;
+      }
+
+      if (Index < BlockLengths[BlockIndex]) {
+        Codewords[CodewordIndex++] = Blocks[BlockIndex][Index];
+      }
     }
   }
 
-  for (UINTN Offset = 0; Offset < QR_BLOCK_ECC_CODEWORDS; Offset++) {
-    for (UINTN Block = 0; Block < QR_NUM_BLOCKS; Block++) {
-      Codewords[Index++] = ParityBlocks[Block][Offset];
-    }
+  if (CodewordIndex != TotalCodewords) {
+    return EFI_BAD_BUFFER_SIZE;
   }
+
+  return EFI_SUCCESS;
 }
 
 STATIC
 VOID
 DrawFinderPattern(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
+  IN OUT QR_MODULE_MATRIX      Modules,
+  IN OUT QR_FUNCTION_MATRIX    FunctionModules,
   IN     INTN    X,
-  IN     INTN    Y
+  IN     INTN    Y,
+  IN     UINTN   Size
   )
 {
   for (INTN Dy = 0; Dy < 7; Dy++) {
     for (INTN Dx = 0; Dx < 7; Dx++) {
       INTN PosX = X + Dx;
       INTN PosY = Y + Dy;
-      if (PosX < 0 || PosY < 0 || PosX >= QR_SIZE_PIXELS || PosY >= QR_SIZE_PIXELS) {
+      if (PosX < 0 || PosY < 0 || PosX >= (INTN)Size || PosY >= (INTN)Size) {
         continue;
       }
 
@@ -305,7 +518,7 @@ DrawFinderPattern(
     for (INTN Dx = -1; Dx <= 7; Dx++) {
       INTN PosX = X + Dx;
       INTN PosY = Y + Dy;
-      if (PosX < 0 || PosY < 0 || PosX >= QR_SIZE_PIXELS || PosY >= QR_SIZE_PIXELS) {
+      if (PosX < 0 || PosY < 0 || PosX >= (INTN)Size || PosY >= (INTN)Size) {
         continue;
       }
 
@@ -322,17 +535,18 @@ DrawFinderPattern(
 STATIC
 VOID
 DrawAlignmentPattern(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
+  IN OUT QR_MODULE_MATRIX      Modules,
+  IN OUT QR_FUNCTION_MATRIX    FunctionModules,
   IN     INTN    CenterX,
-  IN     INTN    CenterY
+  IN     INTN    CenterY,
+  IN     UINTN   Size
   )
 {
   for (INTN Dy = -2; Dy <= 2; Dy++) {
     for (INTN Dx = -2; Dx <= 2; Dx++) {
       INTN PosX = CenterX + Dx;
       INTN PosY = CenterY + Dy;
-      if (PosX < 0 || PosY < 0 || PosX >= QR_SIZE_PIXELS || PosY >= QR_SIZE_PIXELS) {
+      if (PosX < 0 || PosY < 0 || PosX >= (INTN)Size || PosY >= (INTN)Size) {
         continue;
       }
 
@@ -349,20 +563,23 @@ DrawAlignmentPattern(
 STATIC
 VOID
 DrawAlignmentPatterns(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  IN OUT QR_MODULE_MATRIX      Modules,
+  IN OUT QR_FUNCTION_MATRIX    FunctionModules,
+  IN     CONST UINT8          *Centers,
+  IN     UINTN                 CenterCount,
+  IN     UINTN                 Size
   )
 {
-  if (QR_ALIGNMENT_PATTERN_COUNT == 0) {
+  if ((Centers == NULL) || (CenterCount == 0)) {
     return;
   }
 
-  UINT8 LastCenter = mAlignmentPatternCenters[QR_ALIGNMENT_PATTERN_COUNT - 1];
+  UINT8 LastCenter = Centers[CenterCount - 1];
 
-  for (UINTN YIndex = 0; YIndex < QR_ALIGNMENT_PATTERN_COUNT; YIndex++) {
-    for (UINTN XIndex = 0; XIndex < QR_ALIGNMENT_PATTERN_COUNT; XIndex++) {
-      UINT8 CenterX = mAlignmentPatternCenters[XIndex];
-      UINT8 CenterY = mAlignmentPatternCenters[YIndex];
+  for (UINTN YIndex = 0; YIndex < CenterCount; YIndex++) {
+    for (UINTN XIndex = 0; XIndex < CenterCount; XIndex++) {
+      UINT8 CenterX = Centers[XIndex];
+      UINT8 CenterY = Centers[YIndex];
 
       if (((CenterX == 6) && (CenterY == 6)) ||
           ((CenterX == 6) && (CenterY == LastCenter)) ||
@@ -370,7 +587,7 @@ DrawAlignmentPatterns(
         continue;
       }
 
-      DrawAlignmentPattern(Modules, FunctionModules, CenterX, CenterY);
+      DrawAlignmentPattern(Modules, FunctionModules, CenterX, CenterY, Size);
     }
   }
 }
@@ -378,11 +595,12 @@ DrawAlignmentPatterns(
 STATIC
 VOID
 DrawTimingPatterns(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  IN OUT QR_MODULE_MATRIX      Modules,
+  IN OUT QR_FUNCTION_MATRIX    FunctionModules,
+  IN     UINTN                 Size
   )
 {
-  for (INTN Index = 0; Index < QR_SIZE_PIXELS; Index++) {
+  for (INTN Index = 0; Index < (INTN)Size; Index++) {
     if (!FunctionModules[6][Index]) {
       Modules[6][Index] = (INT8)((Index % 2) == 0);
       FunctionModules[6][Index] = TRUE;
@@ -397,7 +615,8 @@ DrawTimingPatterns(
 STATIC
 VOID
 ReserveFormatInfo(
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  IN OUT QR_FUNCTION_MATRIX FunctionModules,
+  IN     UINTN              Size
   )
 {
   for (INTN Index = 0; Index <= 8; Index++) {
@@ -408,23 +627,24 @@ ReserveFormatInfo(
   }
 
   for (INTN Index = 0; Index < 7; Index++) {
-    FunctionModules[8][QR_SIZE_PIXELS - 1 - Index] = TRUE;
-    FunctionModules[QR_SIZE_PIXELS - 1 - Index][8] = TRUE;
+    FunctionModules[8][(INTN)Size - 1 - Index] = TRUE;
+    FunctionModules[(INTN)Size - 1 - Index][8] = TRUE;
   }
 
-  FunctionModules[8][QR_SIZE_PIXELS - 8] = TRUE;
-  FunctionModules[QR_SIZE_PIXELS - 8][8] = TRUE;
+  FunctionModules[8][(INTN)Size - 8] = TRUE;
+  FunctionModules[(INTN)Size - 8][8] = TRUE;
 }
 
 STATIC
 BOOLEAN
 IsFunctionModule(
-  IN BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN INTN    X,
-  IN INTN    Y
+  IN CONST QR_FUNCTION_MATRIX FunctionModules,
+  IN INTN                     X,
+  IN INTN                     Y,
+  IN UINTN                    Size
   )
 {
-  if (X < 0 || Y < 0 || X >= QR_SIZE_PIXELS || Y >= QR_SIZE_PIXELS) {
+  if (X < 0 || Y < 0 || X >= (INTN)Size || Y >= (INTN)Size) {
     return TRUE;
   }
   return FunctionModules[Y][X];
@@ -433,26 +653,27 @@ IsFunctionModule(
 STATIC
 VOID
 PlaceDataBits(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN     BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN     CONST UINT8 *Bits,
-  IN     UINTN        BitCount
+  IN OUT QR_MODULE_MATRIX            Modules,
+  IN     CONST QR_FUNCTION_MATRIX    FunctionModules,
+  IN     CONST UINT8                *Bits,
+  IN     UINTN                       BitCount,
+  IN     UINTN                       Size
   )
 {
   UINTN BitIndex = 0;
   BOOLEAN GoingUp = TRUE;
 
-  for (INTN Column = QR_SIZE_PIXELS - 1; Column > 0; Column -= 2) {
+  for (INTN Column = (INTN)Size - 1; Column > 0; Column -= 2) {
     if (Column == 6) {
       Column--;
     }
 
-    for (INTN Offset = 0; Offset < QR_SIZE_PIXELS; Offset++) {
-      INTN Row = GoingUp ? (QR_SIZE_PIXELS - 1 - Offset) : Offset;
+    for (INTN Offset = 0; Offset < (INTN)Size; Offset++) {
+      INTN Row = GoingUp ? ((INTN)Size - 1 - Offset) : Offset;
 
       for (INTN ColumnOffset = 0; ColumnOffset < 2; ColumnOffset++) {
         INTN CurrentColumn = Column - ColumnOffset;
-        if (IsFunctionModule(FunctionModules, CurrentColumn, Row)) {
+        if (IsFunctionModule(FunctionModules, CurrentColumn, Row, Size)) {
           continue;
         }
 
@@ -502,13 +723,14 @@ MaskBit(
 STATIC
 VOID
 ApplyMask(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN     BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN     UINTN   Mask
+  IN OUT QR_MODULE_MATRIX         Modules,
+  IN     CONST QR_FUNCTION_MATRIX FunctionModules,
+  IN     UINTN                    Mask,
+  IN     UINTN                    Size
   )
 {
-  for (INTN Y = 0; Y < QR_SIZE_PIXELS; Y++) {
-    for (INTN X = 0; X < QR_SIZE_PIXELS; X++) {
+  for (INTN Y = 0; Y < (INTN)Size; Y++) {
+    for (INTN X = 0; X < (INTN)Size; X++) {
       if (FunctionModules[Y][X]) {
         continue;
       }
@@ -544,9 +766,10 @@ CalculateFormatBits(
 STATIC
 VOID
 DrawFormatBits(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN     UINTN   Mask
+  IN OUT QR_MODULE_MATRIX      Modules,
+  IN OUT QR_FUNCTION_MATRIX    FunctionModules,
+  IN     UINTN                 Mask,
+  IN     UINTN                 Size
   )
 {
   UINT16 Format = CalculateFormatBits(Mask);
@@ -570,41 +793,43 @@ DrawFormatBits(
 
   for (INTN Index = 0; Index < 8; Index++) {
     UINT8 Bit = (UINT8)((Format >> Index) & 0x1);
-    INTN  Column = (INTN)QR_SIZE_PIXELS - 1 - Index;
+    INTN  Column = (INTN)Size - 1 - Index;
     Modules[8][Column] = (INT8)Bit;
     FunctionModules[8][Column] = TRUE;
   }
 
   for (INTN Index = 0; Index < 8; Index++) {
     UINT8 Bit = (UINT8)((Format >> (14 - Index)) & 0x1);
-    INTN  Row = (INTN)QR_SIZE_PIXELS - 1 - Index;
+    INTN  Row = (INTN)Size - 1 - Index;
     Modules[Row][8] = (INT8)Bit;
     FunctionModules[Row][8] = TRUE;
   }
 
-  Modules[QR_SIZE_PIXELS - 8][8] = 1;
-  FunctionModules[QR_SIZE_PIXELS - 8][8] = TRUE;
+  Modules[(INTN)Size - 8][8] = 1;
+  FunctionModules[(INTN)Size - 8][8] = TRUE;
 }
 
 STATIC
 VOID
 DrawVersionInformation(
-  IN OUT INT8    Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS],
-  IN OUT BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  IN OUT QR_MODULE_MATRIX      Modules,
+  IN OUT QR_FUNCTION_MATRIX    FunctionModules,
+  IN     UINTN                 Version,
+  IN     UINTN                 Size
   )
 {
-  if (QR_VERSION < 7) {
+  if (Version < 7) {
     return;
   }
 
-  UINT32 VersionInfo = QR_VERSION_INFORMATION;
+  UINT32 VersionInfo = ComputeVersionInformation(Version);
 
   for (UINTN Index = 0; Index < 6; Index++) {
     UINT8 Bit0 = (UINT8)((VersionInfo >> (Index * 3)) & 0x1);
     UINT8 Bit1 = (UINT8)((VersionInfo >> ((Index * 3) + 1)) & 0x1);
     UINT8 Bit2 = (UINT8)((VersionInfo >> ((Index * 3) + 2)) & 0x1);
 
-    INTN BottomRow = (INTN)QR_SIZE_PIXELS - 11;
+    INTN BottomRow = (INTN)Size - 11;
     Modules[BottomRow][Index] = (INT8)Bit0;
     FunctionModules[BottomRow][Index] = TRUE;
     Modules[BottomRow + 1][Index] = (INT8)Bit1;
@@ -612,7 +837,7 @@ DrawVersionInformation(
     Modules[BottomRow + 2][Index] = (INT8)Bit2;
     FunctionModules[BottomRow + 2][Index] = TRUE;
 
-    INTN RightColumn = (INTN)QR_SIZE_PIXELS - 11;
+    INTN RightColumn = (INTN)Size - 11;
     Modules[Index][RightColumn] = (INT8)Bit0;
     FunctionModules[Index][RightColumn] = TRUE;
     Modules[Index][RightColumn + 1] = (INT8)Bit1;
@@ -625,13 +850,14 @@ DrawVersionInformation(
 STATIC
 INT32
 ScoreRunPenalty(
-  IN INT8 Line[QR_SIZE_PIXELS]
+  IN CONST INT8 *Line,
+  IN UINTN       Length
   )
 {
   INT32 Penalty = 0;
   INTN RunLength = 1;
 
-  for (INTN Index = 1; Index < QR_SIZE_PIXELS; Index++) {
+  for (INTN Index = 1; Index < (INTN)Length; Index++) {
     if (Line[Index] == Line[Index - 1]) {
       RunLength++;
     } else {
@@ -654,54 +880,59 @@ ScoreRunPenalty(
 STATIC
 INT32
 EvaluatePenalty(
-  IN INT8 Modules[QR_SIZE_PIXELS][QR_SIZE_PIXELS]
+  IN CONST QR_MODULE_MATRIX Modules,
+  IN UINTN                  Size
   )
 {
   INT32 Penalty = 0;
 
-  for (INTN Y = 0; Y < QR_SIZE_PIXELS; Y++) {
-    Penalty += ScoreRunPenalty(Modules[Y]);
+  for (INTN Y = 0; Y < (INTN)Size; Y++) {
+    Penalty += ScoreRunPenalty(Modules[Y], Size);
   }
 
-  for (INTN X = 0; X < QR_SIZE_PIXELS; X++) {
-    INT8 Column[QR_SIZE_PIXELS];
-    for (INTN Y = 0; Y < QR_SIZE_PIXELS; Y++) {
+  INT8 Column[COMPUTER_INFO_QR_MAX_SIZE];
+  for (INTN X = 0; X < (INTN)Size; X++) {
+    for (INTN Y = 0; Y < (INTN)Size; Y++) {
       Column[Y] = Modules[Y][X];
     }
-    Penalty += ScoreRunPenalty(Column);
+    Penalty += ScoreRunPenalty(Column, Size);
   }
 
-  for (INTN Y = 0; Y < QR_SIZE_PIXELS - 1; Y++) {
-    for (INTN X = 0; X < QR_SIZE_PIXELS - 1; X++) {
+  for (INTN Y = 0; Y < (INTN)Size - 1; Y++) {
+    for (INTN X = 0; X < (INTN)Size - 1; X++) {
       INT8 Value = Modules[Y][X];
-      if (Value == Modules[Y][X + 1] &&
-          Value == Modules[Y + 1][X] &&
-          Value == Modules[Y + 1][X + 1]) {
+      if ((Value == Modules[Y][X + 1]) &&
+          (Value == Modules[Y + 1][X]) &&
+          (Value == Modules[Y + 1][X + 1])) {
         Penalty += 3;
       }
     }
   }
 
-  for (INTN Y = 0; Y < QR_SIZE_PIXELS; Y++) {
-    for (INTN X = 0; X <= QR_SIZE_PIXELS - 11; X++) {
-      if (Modules[Y][X] && !Modules[Y][X + 1] && Modules[Y][X + 2] && Modules[Y][X + 3] && Modules[Y][X + 4] && !Modules[Y][X + 5] && Modules[Y][X + 6] &&
+  for (INTN Y = 0; Y < (INTN)Size; Y++) {
+    for (INTN X = 0; X <= (INTN)Size - 11; X++) {
+      if (Modules[Y][X] && !Modules[Y][X + 1] && Modules[Y][X + 2] && Modules[Y][X + 3] && Modules[Y][X + 4] &&
+          !Modules[Y][X + 5] && Modules[Y][X + 6] &&
           !Modules[Y][X + 7] && !Modules[Y][X + 8] && !Modules[Y][X + 9] && !Modules[Y][X + 10]) {
         Penalty += 40;
       }
-      if (!Modules[Y][X] && Modules[Y][X + 1] && !Modules[Y][X + 2] && !Modules[Y][X + 3] && !Modules[Y][X + 4] && Modules[Y][X + 5] && !Modules[Y][X + 6] &&
+      if (!Modules[Y][X] && Modules[Y][X + 1] && !Modules[Y][X + 2] && !Modules[Y][X + 3] && !Modules[Y][X + 4] &&
+          Modules[Y][X + 5] && !Modules[Y][X + 6] &&
           Modules[Y][X + 7] && Modules[Y][X + 8] && Modules[Y][X + 9] && Modules[Y][X + 10]) {
         Penalty += 40;
       }
     }
   }
 
-  for (INTN X = 0; X < QR_SIZE_PIXELS; X++) {
-    for (INTN Y = 0; Y <= QR_SIZE_PIXELS - 11; Y++) {
-      if (Modules[Y][X] && !Modules[Y + 1][X] && Modules[Y + 2][X] && Modules[Y + 3][X] && Modules[Y + 4][X] && !Modules[Y + 5][X] && Modules[Y + 6][X] &&
+  for (INTN X = 0; X < (INTN)Size; X++) {
+    for (INTN Y = 0; Y <= (INTN)Size - 11; Y++) {
+      if (Modules[Y][X] && !Modules[Y + 1][X] && Modules[Y + 2][X] && Modules[Y + 3][X] && Modules[Y + 4][X] &&
+          !Modules[Y + 5][X] && Modules[Y + 6][X] &&
           !Modules[Y + 7][X] && !Modules[Y + 8][X] && !Modules[Y + 9][X] && !Modules[Y + 10][X]) {
         Penalty += 40;
       }
-      if (!Modules[Y][X] && Modules[Y + 1][X] && !Modules[Y + 2][X] && !Modules[Y + 3][X] && !Modules[Y + 4][X] && Modules[Y + 5][X] && !Modules[Y + 6][X] &&
+      if (!Modules[Y][X] && Modules[Y + 1][X] && !Modules[Y + 2][X] && !Modules[Y + 3][X] && !Modules[Y + 4][X] &&
+          Modules[Y + 5][X] && !Modules[Y + 6][X] &&
           Modules[Y + 7][X] && Modules[Y + 8][X] && Modules[Y + 9][X] && Modules[Y + 10][X]) {
         Penalty += 40;
       }
@@ -709,15 +940,15 @@ EvaluatePenalty(
   }
 
   UINTN DarkCount = 0;
-  for (INTN Y = 0; Y < QR_SIZE_PIXELS; Y++) {
-    for (INTN X = 0; X < QR_SIZE_PIXELS; X++) {
+  for (INTN Y = 0; Y < (INTN)Size; Y++) {
+    for (INTN X = 0; X < (INTN)Size; X++) {
       if (Modules[Y][X]) {
         DarkCount++;
       }
     }
   }
 
-  UINTN TotalModules = QR_SIZE_PIXELS * QR_SIZE_PIXELS;
+  UINTN TotalModules = Size * Size;
   INTN Percent = (INTN)((DarkCount * 100 + TotalModules / 2) / TotalModules);
   INTN FivePercent = ABS(Percent - 50) / 5;
   Penalty += (INT32)FivePercent * 10;
@@ -732,80 +963,114 @@ GenerateComputerInfoQrCode(
   OUT COMPUTER_INFO_QR_CODE *QrCode
   )
 {
-  if (Payload == NULL || QrCode == NULL) {
+  if ((Payload == NULL) || (QrCode == NULL)) {
     return EFI_INVALID_PARAMETER;
   }
 
-  if (PayloadLength == 0 || PayloadLength > COMPUTER_INFO_QR_MAX_DATA_LENGTH) {
+  if ((PayloadLength == 0) || (PayloadLength > COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH)) {
     return EFI_BAD_BUFFER_SIZE;
   }
 
   InitializeGaloisTables();
 
-  UINT8 DataCodewords[QR_DATA_CODEWORDS];
-  EFI_STATUS Status = BuildDataCodewords(Payload, PayloadLength, DataCodewords);
+  UINTN SelectedVersion = 0;
+  for (UINTN Version = COMPUTER_INFO_QR_MIN_VERSION; Version <= COMPUTER_INFO_QR_MAX_VERSION; Version++) {
+    UINTN Capacity = GetDataCodewordCapacity(Version);
+    if ((Capacity != 0) && (PayloadLength <= Capacity)) {
+      SelectedVersion = Version;
+      break;
+    }
+  }
+
+  if (SelectedVersion == 0) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  UINTN Size = 4 * SelectedVersion + 17;
+  UINTN DataCapacity = GetDataCodewordCapacity(SelectedVersion);
+  UINTN TotalCodewords = GetTotalCodewords(SelectedVersion);
+  UINTN RemainderBits = GetRemainderBits(SelectedVersion);
+  UINTN NumBlocks = GetNumErrorCorrectionBlocks(SelectedVersion);
+  UINTN EccCodewordsPerBlock = GetEccCodewordsPerBlock(SelectedVersion);
+
+  UINT8 AlignmentCenters[QR_MAX_ALIGNMENT_PATTERN_COUNT];
+  UINTN AlignmentCount;
+  GetAlignmentPatternCenters(SelectedVersion, AlignmentCenters, &AlignmentCount);
+
+  UINT8 DataCodewords[COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH];
+  EFI_STATUS Status = BuildDataCodewords(Payload, PayloadLength, DataCodewords, DataCapacity);
   if (EFI_ERROR(Status)) {
     return Status;
   }
 
-  UINT8 Codewords[QR_TOTAL_CODEWORDS];
-  BuildCodewordSequence(DataCodewords, Codewords);
+  UINT8 Codewords[COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS];
+  Status = BuildCodewordSequence(
+             DataCodewords,
+             DataCapacity,
+             TotalCodewords,
+             NumBlocks,
+             EccCodewordsPerBlock,
+             Codewords
+             );
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
 
-  UINTN TotalDataBits = QR_TOTAL_CODEWORDS * 8 + QR_REMAINDER_BITS;
-  UINT8 DataBits[QR_TOTAL_CODEWORDS * 8 + QR_REMAINDER_BITS];
-  for (UINTN Bit = 0; Bit < QR_TOTAL_CODEWORDS * 8; Bit++) {
+  UINTN TotalDataBits = TotalCodewords * 8 + RemainderBits;
+  UINT8 DataBits[COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS * 8 + 7];
+  for (UINTN Bit = 0; Bit < TotalCodewords * 8; Bit++) {
     UINT8 Byte = Codewords[Bit / 8];
     DataBits[Bit] = (UINT8)((Byte >> (7 - (Bit % 8))) & 0x1);
   }
-  for (UINTN Bit = QR_TOTAL_CODEWORDS * 8; Bit < TotalDataBits; Bit++) {
+  for (UINTN Bit = TotalCodewords * 8; Bit < TotalDataBits; Bit++) {
     DataBits[Bit] = 0;
   }
 
-  INT8 BaseModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS];
-  BOOLEAN FunctionModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS];
-  for (INTN Y = 0; Y < QR_SIZE_PIXELS; Y++) {
-    for (INTN X = 0; X < QR_SIZE_PIXELS; X++) {
-      BaseModules[Y][X] = 0;
-      FunctionModules[Y][X] = FALSE;
-    }
-  }
+  QR_MODULE_MATRIX BaseModules;
+  QR_FUNCTION_MATRIX FunctionModules;
+  ZeroMem(BaseModules, sizeof(BaseModules));
+  ZeroMem(FunctionModules, sizeof(FunctionModules));
 
-  DrawFinderPattern(BaseModules, FunctionModules, 0, 0);
-  DrawFinderPattern(BaseModules, FunctionModules, QR_SIZE_PIXELS - 7, 0);
-  DrawFinderPattern(BaseModules, FunctionModules, 0, QR_SIZE_PIXELS - 7);
+  DrawFinderPattern(BaseModules, FunctionModules, 0, 0, Size);
+  DrawFinderPattern(BaseModules, FunctionModules, (INTN)Size - 7, 0, Size);
+  DrawFinderPattern(BaseModules, FunctionModules, 0, (INTN)Size - 7, Size);
 
-  DrawTimingPatterns(BaseModules, FunctionModules);
+  DrawTimingPatterns(BaseModules, FunctionModules, Size);
 
-  DrawAlignmentPatterns(BaseModules, FunctionModules);
+  DrawAlignmentPatterns(BaseModules, FunctionModules, AlignmentCenters, AlignmentCount, Size);
 
-  ReserveFormatInfo(FunctionModules);
-  DrawVersionInformation(BaseModules, FunctionModules);
+  ReserveFormatInfo(FunctionModules, Size);
+  DrawVersionInformation(BaseModules, FunctionModules, SelectedVersion, Size);
 
-  BaseModules[QR_SIZE_PIXELS - 8][8] = 1;
-  FunctionModules[QR_SIZE_PIXELS - 8][8] = TRUE;
+  BaseModules[(INTN)Size - 8][8] = 1;
+  FunctionModules[(INTN)Size - 8][8] = TRUE;
 
-  PlaceDataBits(BaseModules, FunctionModules, DataBits, TotalDataBits);
+  PlaceDataBits(BaseModules, FunctionModules, DataBits, TotalDataBits, Size);
 
   INT32 BestPenalty = MAX_INT32;
-  INT8 BestModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS];
+  QR_MODULE_MATRIX BestModules;
+  ZeroMem(BestModules, sizeof(BestModules));
 
   for (UINTN Mask = 0; Mask < 8; Mask++) {
-    INT8 MaskedModules[QR_SIZE_PIXELS][QR_SIZE_PIXELS];
-    BOOLEAN MaskedFunction[QR_SIZE_PIXELS][QR_SIZE_PIXELS];
+    QR_MODULE_MATRIX MaskedModules;
+    QR_FUNCTION_MATRIX MaskedFunction;
     CopyMem(MaskedModules, BaseModules, sizeof(BaseModules));
     CopyMem(MaskedFunction, FunctionModules, sizeof(FunctionModules));
 
-    ApplyMask(MaskedModules, MaskedFunction, Mask);
-    DrawFormatBits(MaskedModules, MaskedFunction, Mask);
+    ApplyMask(MaskedModules, MaskedFunction, Mask, Size);
+    DrawFormatBits(MaskedModules, MaskedFunction, Mask, Size);
 
-    INT32 Penalty = EvaluatePenalty(MaskedModules);
+    INT32 Penalty = EvaluatePenalty(MaskedModules, Size);
     if (Penalty < BestPenalty) {
       BestPenalty = Penalty;
       CopyMem(BestModules, MaskedModules, sizeof(BestModules));
     }
   }
 
-  CopyMem(QrCode->Modules, BestModules, sizeof(BestModules));
-  QrCode->Size = QR_SIZE_PIXELS;
+  for (UINTN Y = 0; Y < Size; Y++) {
+    CopyMem(QrCode->Modules[Y], BestModules[Y], Size * sizeof(UINT8));
+  }
+
+  QrCode->Size = Size;
   return EFI_SUCCESS;
 }
