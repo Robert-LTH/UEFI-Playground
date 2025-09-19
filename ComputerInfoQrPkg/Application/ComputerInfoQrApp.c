@@ -45,10 +45,19 @@
 #define DHCP_OPTION_MAX_LENGTH              255
 #define IPV4_STRING_BUFFER_LENGTH           16
 
+STATIC BOOLEAN mWaitForKeyPressSupported = TRUE;
+
 STATIC
 EFI_STATUS
 WaitForKeyPress(
   OUT EFI_INPUT_KEY *Key OPTIONAL
+  );
+
+STATIC
+VOID
+PauseWithPrompt(
+  IN CONST CHAR16 *Prompt,
+  IN CONST CHAR16 *ErrorPrefix OPTIONAL
   );
 
 STATIC
@@ -967,6 +976,35 @@ Ipv4AddressToString(
 
 STATIC
 VOID
+PauseWithPrompt(
+  IN CONST CHAR16 *Prompt,
+  IN CONST CHAR16 *ErrorPrefix OPTIONAL
+  )
+{
+  EFI_STATUS Status;
+
+  if (!mWaitForKeyPressSupported) {
+    return;
+  }
+
+  if (Prompt != NULL) {
+    Print(L"%s", Prompt);
+  }
+
+  Status = WaitForKeyPress(NULL);
+  if (EFI_ERROR(Status)) {
+    if (ErrorPrefix != NULL) {
+      Print(L"%sUnable to read key press: %r\n", ErrorPrefix, Status);
+    } else {
+      Print(L"Unable to read key press: %r\n", Status);
+    }
+
+    mWaitForKeyPressSupported = FALSE;
+  }
+}
+
+STATIC
+VOID
 PrintDhcpOptions(
   IN CONST EFI_DHCP4_PACKET *Packet
   )
@@ -976,20 +1014,27 @@ PrintDhcpOptions(
     return;
   }
 
-  CONST UINT8 *Option = Packet->Dhcp4.Option;
-  CONST UINT8 *End    = ((CONST UINT8 *)Packet) + Packet->Length;
+  CONST UINT8 *Option         = Packet->Dhcp4.Option;
+  CONST UINT8 *End            = ((CONST UINT8 *)Packet) + Packet->Length;
   CHAR16       AsciiBuffer[DHCP_OPTION_MAX_LENGTH + 1];
+  UINTN        OptionsPrinted = 0;
 
   while (Option < End) {
     UINT8 OptionCode = *Option++;
 
     if (OptionCode == DHCP_OPTION_PAD) {
       Print(L"    Option 0 (Pad)\n");
+      OptionsPrinted++;
+      if (((OptionsPrinted % 4) == 0) && (Option < End)) {
+        PauseWithPrompt(L"    Press any key to view more DHCP options...\n", L"    ");
+      }
+
       continue;
     }
 
     if (OptionCode == DHCP_OPTION_END) {
       Print(L"    Option 255 (End)\n");
+      OptionsPrinted++;
       break;
     }
 
@@ -1038,6 +1083,11 @@ PrintDhcpOptions(
     }
 
     Option += OptionLength;
+    OptionsPrinted++;
+
+    if (((OptionsPrinted % 4) == 0) && (Option < End)) {
+      PauseWithPrompt(L"    Press any key to view more DHCP options...\n", L"    ");
+    }
   }
 }
 
@@ -1590,6 +1640,7 @@ DisplayDhcpInterfaceInformation(
       Print(L"  Boot File Name: %a\n", BootFileName);
     }
 
+    PauseWithPrompt(L"  Press any key to view DHCP options...\n", L"  ");
     Print(L"  DHCP Options:\n");
     PrintDhcpOptions(ModeData.ReplyPacket);
   } else {
