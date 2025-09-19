@@ -21,7 +21,9 @@
 
 #define QUIET_ZONE_SIZE                 2
 #define INFO_BUFFER_LENGTH              (COMPUTER_INFO_QR_MAX_DATA_LENGTH + 1)
-#define JSON_PAYLOAD_BUFFER_LENGTH      512
+#define JSON_PAYLOAD_BUFFER_LENGTH      1024
+#define HARDWARE_MODEL_BUFFER_LENGTH    128
+#define HARDWARE_SIZE_BUFFER_LENGTH     64
 #define UUID_STRING_LENGTH              36
 #define UUID_STRING_BUFFER_LENGTH       (UUID_STRING_LENGTH + 1)
 #define MAC_ADDRESS_MAX_BYTES           32
@@ -178,6 +180,15 @@ CopySmbiosString(
   }
 
   AsciiStrnCpyS(Destination, DestinationSize, Current, DestinationSize - 1);
+}
+
+STATIC
+VOID
+NormalizeAsciiString(
+  IN OUT CHAR8 *String
+  )
+{
+  TrimAndSanitizeSerialNumber(String);
 }
 
 STATIC
@@ -378,19 +389,23 @@ UpdateUuidAndSerialFromRecord(
   }
 }
 
+typedef
+BOOLEAN
+(*SMBIOS_RECORD_VISITOR)(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT VOID               *Context
+  );
+
 STATIC
 VOID
-ScanRawSmbiosTable(
+EnumerateRawSmbiosTable(
   IN CONST UINT8 *TableStart,
   IN UINTN        TableLength,
-  IN OUT BOOLEAN *UuidFound,
-  IN OUT BOOLEAN *SerialFound,
-  OUT EFI_GUID   *SystemUuid,
-  OUT CHAR8      *SerialNumber,
-  IN UINTN        SerialBufferLength
+  IN SMBIOS_RECORD_VISITOR Visitor,
+  IN OUT VOID               *Context
   )
 {
-  if ((TableStart == NULL) || (TableLength == 0)) {
+  if ((TableStart == NULL) || (TableLength == 0) || (Visitor == NULL)) {
     return;
   }
 
@@ -413,16 +428,7 @@ ScanRawSmbiosTable(
       break;
     }
 
-    UpdateUuidAndSerialFromRecord(
-      Header,
-      UuidFound,
-      SerialFound,
-      SystemUuid,
-      SerialNumber,
-      SerialBufferLength
-      );
-
-    if (((UuidFound == NULL) || (*UuidFound)) && ((SerialFound == NULL) || (*SerialFound))) {
+    if (!Visitor(Header, Context)) {
       break;
     }
 
@@ -442,16 +448,72 @@ ScanRawSmbiosTable(
       Next++;
     }
 
-    if (Next >= End) {
-      break;
-    }
-
-    if (Header->Type == SMBIOS_TYPE_END_OF_TABLE) {
+    if ((Header->Type == SMBIOS_TYPE_END_OF_TABLE) || (Next >= End)) {
       break;
     }
 
     Current = Next;
   }
+}
+
+typedef struct {
+  BOOLEAN   *UuidFound;
+  BOOLEAN   *SerialFound;
+  EFI_GUID  *SystemUuid;
+  CHAR8     *SerialNumber;
+  UINTN      SerialBufferLength;
+} UUID_SERIAL_CONTEXT;
+
+STATIC
+BOOLEAN
+UpdateUuidSerialVisitor(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT VOID               *Context
+  )
+{
+  UUID_SERIAL_CONTEXT *State = (UUID_SERIAL_CONTEXT *)Context;
+
+  UpdateUuidAndSerialFromRecord(
+    Record,
+    State->UuidFound,
+    State->SerialFound,
+    State->SystemUuid,
+    State->SerialNumber,
+    State->SerialBufferLength
+    );
+
+  if (((State->UuidFound == NULL) || (*(State->UuidFound))) &&
+      ((State->SerialFound == NULL) || (*(State->SerialFound)))) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+STATIC
+VOID
+ScanRawSmbiosTable(
+  IN CONST UINT8 *TableStart,
+  IN UINTN        TableLength,
+  IN OUT BOOLEAN *UuidFound,
+  IN OUT BOOLEAN *SerialFound,
+  OUT EFI_GUID   *SystemUuid,
+  OUT CHAR8      *SerialNumber,
+  IN UINTN        SerialBufferLength
+  )
+{
+  if ((TableStart == NULL) || (TableLength == 0)) {
+    return;
+  }
+
+  UUID_SERIAL_CONTEXT Context;
+  Context.UuidFound          = UuidFound;
+  Context.SerialFound        = SerialFound;
+  Context.SystemUuid         = SystemUuid;
+  Context.SerialNumber       = SerialNumber;
+  Context.SerialBufferLength = SerialBufferLength;
+
+  EnumerateRawSmbiosTable(TableStart, TableLength, UpdateUuidSerialVisitor, &Context);
 }
 
 STATIC
@@ -717,31 +779,48 @@ BuildJsonPayload(
   IN  UINTN        JsonBufferSize,
   IN  CONST CHAR8 *UuidString,
   IN  CONST CHAR8 *MacString,
-  IN  CONST CHAR8 *SerialNumber
+  IN  CONST CHAR8 *SerialNumber,
+  IN  CONST CHAR8 *CpuModel,
+  IN  CONST CHAR8 *CpuSize,
+  IN  CONST CHAR8 *BoardModel,
+  IN  CONST CHAR8 *BoardSize,
+  IN  CONST CHAR8 *MemoryModel,
+  IN  CONST CHAR8 *MemorySize
   )
 {
   if ((JsonBuffer == NULL) || (JsonBufferSize == 0) ||
-      (UuidString == NULL) || (MacString == NULL) || (SerialNumber == NULL)) {
+      (UuidString == NULL) || (MacString == NULL) || (SerialNumber == NULL) ||
+      (CpuModel == NULL) || (CpuSize == NULL) ||
+      (BoardModel == NULL) || (BoardSize == NULL) ||
+      (MemoryModel == NULL) || (MemorySize == NULL)) {
     return EFI_INVALID_PARAMETER;
   }
 
-  UINTN UuidLength   = AsciiStrLen(UuidString);
-  UINTN MacLength    = AsciiStrLen(MacString);
-  UINTN SerialLength = AsciiStrLen(SerialNumber);
-  UINTN RequiredLength = 39 + UuidLength + MacLength + SerialLength;
+  INTN Result = AsciiSPrint(
+                   JsonBuffer,
+                   JsonBufferSize,
+                   "{\"uuid\":\"%a\",\"mac\":\"%a\",\"serial_number\":\"%a\"," \
+                   "\"cpu\":{\"model\":\"%a\",\"size\":\"%a\"}," \
+                   "\"motherboard\":{\"model\":\"%a\",\"size\":\"%a\"}," \
+                   "\"memory\":{\"model\":\"%a\",\"size\":\"%a\"}}",
+                   UuidString,
+                   MacString,
+                   SerialNumber,
+                   CpuModel,
+                   CpuSize,
+                   BoardModel,
+                   BoardSize,
+                   MemoryModel,
+                   MemorySize
+                   );
 
-  if (RequiredLength >= JsonBufferSize) {
-    return EFI_BUFFER_TOO_SMALL;
+  if (Result < 0) {
+    return EFI_DEVICE_ERROR;
   }
 
-  AsciiSPrint(
-    JsonBuffer,
-    JsonBufferSize,
-    "{\"uuid\":\"%a\",\"mac\":\"%a\",\"serial_number\":\"%a\"}",
-    UuidString,
-    MacString,
-    SerialNumber
-    );
+  if ((UINTN)Result >= JsonBufferSize) {
+    return EFI_BUFFER_TOO_SMALL;
+  }
 
   return EFI_SUCCESS;
 }
@@ -2588,8 +2667,31 @@ UefiMain(
     return Status;
   }
 
+  CHAR8 CpuModel[HARDWARE_MODEL_BUFFER_LENGTH];
+  CHAR8 CpuSize[HARDWARE_SIZE_BUFFER_LENGTH];
+  CHAR8 BoardModel[HARDWARE_MODEL_BUFFER_LENGTH];
+  CHAR8 BoardSize[HARDWARE_SIZE_BUFFER_LENGTH];
+  CHAR8 MemoryModel[HARDWARE_MODEL_BUFFER_LENGTH];
+  CHAR8 MemorySize[HARDWARE_SIZE_BUFFER_LENGTH];
+
+  GetCpuInfo(CpuModel, sizeof(CpuModel), CpuSize, sizeof(CpuSize));
+  GetBaseboardInfo(BoardModel, sizeof(BoardModel), BoardSize, sizeof(BoardSize));
+  GetMemoryInfo(MemoryModel, sizeof(MemoryModel), MemorySize, sizeof(MemorySize));
+
   CHAR8 JsonPayload[JSON_PAYLOAD_BUFFER_LENGTH];
-  Status = BuildJsonPayload(JsonPayload, sizeof(JsonPayload), UuidString, MacString, SerialNumber);
+  Status = BuildJsonPayload(
+             JsonPayload,
+             sizeof(JsonPayload),
+             UuidString,
+             MacString,
+             SerialNumber,
+             CpuModel,
+             CpuSize,
+             BoardModel,
+             BoardSize,
+             MemoryModel,
+             MemorySize
+             );
   if (EFI_ERROR(Status)) {
     Print(L"Failed to build JSON payload: %r\n", Status);
     return Status;
@@ -2662,4 +2764,677 @@ UefiMain(
   }
 
   return ReturnStatus;
+}
+
+typedef struct {
+  CHAR8   *Model;
+  UINTN    ModelSize;
+  CHAR8   *Size;
+  UINTN    SizeSize;
+  BOOLEAN  ModelFound;
+  BOOLEAN  SizeFound;
+} CPU_INFO_CONTEXT;
+
+STATIC
+VOID
+UpdateCpuInfoFromRecord(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT CPU_INFO_CONTEXT   *Context
+  )
+{
+  if ((Record == NULL) || (Context == NULL) || (Record->Type != SMBIOS_TYPE_PROCESSOR_INFORMATION)) {
+    return;
+  }
+
+  CONST SMBIOS_TABLE_TYPE4 *Type4 = (CONST SMBIOS_TABLE_TYPE4 *)Record;
+
+  if ((Context->Model != NULL) && !Context->ModelFound) {
+    if ((UINTN)Record->Length >= (OFFSET_OF(SMBIOS_TABLE_TYPE4, ProcessorVersion) + sizeof(Type4->ProcessorVersion))) {
+      SMBIOS_TABLE_STRING StringNumber = Type4->ProcessorVersion;
+      if (StringNumber != 0) {
+        CHAR8 Temp[HARDWARE_MODEL_BUFFER_LENGTH];
+        ZeroMem(Temp, sizeof(Temp));
+        CopySmbiosString(Temp, sizeof(Temp), Record, StringNumber);
+        NormalizeAsciiString(Temp);
+        if (Temp[0] != '\0') {
+          AsciiStrCpyS(Context->Model, Context->ModelSize, Temp);
+          Context->ModelFound = TRUE;
+        }
+      }
+    }
+  }
+
+  if ((Context->Size != NULL) && !Context->SizeFound) {
+    UINT16 CoreCount = 0;
+
+    if ((UINTN)Record->Length >= (OFFSET_OF(SMBIOS_TABLE_TYPE4, CoreCount2) + sizeof(Type4->CoreCount2))) {
+      if (Type4->CoreCount2 != 0) {
+        CoreCount = Type4->CoreCount2;
+      }
+    }
+
+    if (CoreCount == 0) {
+      if ((UINTN)Record->Length >= (OFFSET_OF(SMBIOS_TABLE_TYPE4, CoreCount) + sizeof(Type4->CoreCount))) {
+        UINT8 CoreCount8 = Type4->CoreCount;
+        if ((CoreCount8 != 0) && (CoreCount8 != 0xFF)) {
+          CoreCount = CoreCount8;
+        }
+      }
+    }
+
+    if (CoreCount > 0) {
+      AsciiSPrint(Context->Size, Context->SizeSize, "%u cores", CoreCount);
+      Context->SizeFound = TRUE;
+    } else {
+      UINT16 Speed = 0;
+
+      if ((UINTN)Record->Length >= (OFFSET_OF(SMBIOS_TABLE_TYPE4, CurrentSpeed) + sizeof(Type4->CurrentSpeed))) {
+        Speed = Type4->CurrentSpeed;
+      }
+
+      if ((Speed == 0) && ((UINTN)Record->Length >= (OFFSET_OF(SMBIOS_TABLE_TYPE4, MaxSpeed) + sizeof(Type4->MaxSpeed)))) {
+        Speed = Type4->MaxSpeed;
+      }
+
+      if (Speed > 0) {
+        AsciiSPrint(Context->Size, Context->SizeSize, "%u MHz", Speed);
+        Context->SizeFound = TRUE;
+      }
+    }
+  }
+}
+
+STATIC
+BOOLEAN
+CpuInfoVisitor(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT VOID               *Context
+  )
+{
+  CPU_INFO_CONTEXT *CpuContext = (CPU_INFO_CONTEXT *)Context;
+
+  UpdateCpuInfoFromRecord(Record, CpuContext);
+
+  if (((CpuContext->Model == NULL) || CpuContext->ModelFound) &&
+      ((CpuContext->Size == NULL) || CpuContext->SizeFound)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+STATIC
+VOID
+GetCpuInfo(
+  OUT CHAR8 *CpuModel,
+  IN UINTN  CpuModelSize,
+  OUT CHAR8 *CpuSize,
+  IN UINTN  CpuSizeSize
+  )
+{
+  BOOLEAN NeedModel = (CpuModel != NULL) && (CpuModelSize > 0);
+  BOOLEAN NeedSize  = (CpuSize != NULL) && (CpuSizeSize > 0);
+
+  if (NeedModel) {
+    CpuModel[0] = '\0';
+  }
+
+  if (NeedSize) {
+    CpuSize[0] = '\0';
+  }
+
+  if (!NeedModel && !NeedSize) {
+    return;
+  }
+
+  CPU_INFO_CONTEXT Context;
+  ZeroMem(&Context, sizeof(Context));
+  Context.Model     = NeedModel ? CpuModel : NULL;
+  Context.ModelSize = CpuModelSize;
+  Context.Size      = NeedSize ? CpuSize : NULL;
+  Context.SizeSize  = CpuSizeSize;
+
+  EFI_SMBIOS_PROTOCOL *Smbios = NULL;
+  EFI_STATUS           Status = gBS->LocateProtocol(&gEfiSmbiosProtocolGuid, NULL, (VOID **)&Smbios);
+  if (!EFI_ERROR(Status) && (Smbios != NULL)) {
+    EFI_SMBIOS_HANDLE       Handle = SMBIOS_HANDLE_PI_RESERVED;
+    EFI_SMBIOS_TABLE_HEADER *Record;
+
+    while (TRUE) {
+      Status = Smbios->GetNext(Smbios, &Handle, NULL, &Record, NULL);
+      if (EFI_ERROR(Status)) {
+        break;
+      }
+
+      if (Record == NULL) {
+        continue;
+      }
+
+      UpdateCpuInfoFromRecord((CONST SMBIOS_STRUCTURE *)Record, &Context);
+
+      if (((!NeedModel) || Context.ModelFound) && ((!NeedSize) || Context.SizeFound)) {
+        break;
+      }
+    }
+  }
+
+  if ((NeedModel && !Context.ModelFound) || (NeedSize && !Context.SizeFound)) {
+    CONST UINT8 *RawTable  = NULL;
+    UINTN        RawLength = 0;
+
+    Status = GetSmbiosRawTable(&RawTable, &RawLength);
+    if (!EFI_ERROR(Status) && (RawTable != NULL) && (RawLength != 0)) {
+      EnumerateRawSmbiosTable(RawTable, RawLength, CpuInfoVisitor, &Context);
+    }
+  }
+
+  if (NeedModel && (!Context.ModelFound || (CpuModel[0] == '\0'))) {
+    AsciiStrCpyS(CpuModel, CpuModelSize, UNKNOWN_STRING);
+  }
+
+  if (NeedSize && (!Context.SizeFound || (CpuSize[0] == '\0'))) {
+    AsciiStrCpyS(CpuSize, CpuSizeSize, UNKNOWN_STRING);
+  }
+}
+
+STATIC
+CONST CHAR8 *
+GetBaseboardTypeDescription(
+  IN UINT8 BoardType
+  )
+{
+  switch (BoardType) {
+    case BaseBoardTypeOther:
+      return "Other";
+    case BaseBoardTypeUnknown:
+      return "Unknown";
+    case BaseBoardTypeServerBlade:
+      return "Server Blade";
+    case BaseBoardTypeConnectivitySwitch:
+      return "Connectivity Switch";
+    case BaseBoardTypeSystemManagementModule:
+      return "System Management Module";
+    case BaseBoardTypeProcessorModule:
+      return "Processor Module";
+    case BaseBoardTypeIOModule:
+      return "I/O Module";
+    case BaseBoardTypeMemoryModule:
+      return "Memory Module";
+    case BaseBoardTypeDaughterBoard:
+      return "Daughter Board";
+    case BaseBoardTypeMotherBoard:
+      return "Motherboard";
+    case BaseBoardTypeProcessorMemoryModule:
+      return "Processor/Memory Module";
+    case BaseBoardTypeProcessorIOModule:
+      return "Processor/I/O Module";
+    case BaseBoardTypeInterconnectBoard:
+      return "Interconnect Board";
+    default:
+      return NULL;
+  }
+}
+
+typedef struct {
+  CHAR8   *Model;
+  UINTN    ModelSize;
+  CHAR8   *Size;
+  UINTN    SizeSize;
+  BOOLEAN  ModelFound;
+  BOOLEAN  SizeFound;
+} BASEBOARD_INFO_CONTEXT;
+
+STATIC
+VOID
+UpdateBaseboardInfoFromRecord(
+  IN CONST SMBIOS_STRUCTURE      *Record,
+  IN OUT BASEBOARD_INFO_CONTEXT  *Context
+  )
+{
+  if ((Record == NULL) || (Context == NULL) || (Record->Type != SMBIOS_TYPE_BASEBOARD_INFORMATION)) {
+    return;
+  }
+
+  CONST SMBIOS_TABLE_TYPE2 *Type2 = (CONST SMBIOS_TABLE_TYPE2 *)Record;
+
+  if ((Context->Model != NULL) && !Context->ModelFound) {
+    if ((UINTN)Record->Length > OFFSET_OF(SMBIOS_TABLE_TYPE2, ProductName)) {
+      SMBIOS_TABLE_STRING StringNumber = Type2->ProductName;
+      if (StringNumber != 0) {
+        CHAR8 Temp[HARDWARE_MODEL_BUFFER_LENGTH];
+        ZeroMem(Temp, sizeof(Temp));
+        CopySmbiosString(Temp, sizeof(Temp), Record, StringNumber);
+        NormalizeAsciiString(Temp);
+        if (Temp[0] != '\0') {
+          AsciiStrCpyS(Context->Model, Context->ModelSize, Temp);
+          Context->ModelFound = TRUE;
+        }
+      }
+    }
+  }
+
+  if ((Context->Model != NULL) && !Context->ModelFound) {
+    if ((UINTN)Record->Length > OFFSET_OF(SMBIOS_TABLE_TYPE2, Version)) {
+      SMBIOS_TABLE_STRING VersionNumber = Type2->Version;
+      if (VersionNumber != 0) {
+        CHAR8 Temp[HARDWARE_MODEL_BUFFER_LENGTH];
+        ZeroMem(Temp, sizeof(Temp));
+        CopySmbiosString(Temp, sizeof(Temp), Record, VersionNumber);
+        NormalizeAsciiString(Temp);
+        if (Temp[0] != '\0') {
+          AsciiStrCpyS(Context->Model, Context->ModelSize, Temp);
+          Context->ModelFound = TRUE;
+        }
+      }
+    }
+  }
+
+  if ((Context->Size != NULL) && !Context->SizeFound) {
+    CONST CHAR8 *Description = GetBaseboardTypeDescription(Type2->BoardType);
+    if ((Description != NULL) && (Description[0] != '\0')) {
+      AsciiStrCpyS(Context->Size, Context->SizeSize, Description);
+      Context->SizeFound = TRUE;
+    }
+  }
+}
+
+STATIC
+BOOLEAN
+BaseboardInfoVisitor(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT VOID               *Context
+  )
+{
+  BASEBOARD_INFO_CONTEXT *BoardContext = (BASEBOARD_INFO_CONTEXT *)Context;
+
+  UpdateBaseboardInfoFromRecord(Record, BoardContext);
+
+  if (((BoardContext->Model == NULL) || BoardContext->ModelFound) &&
+      ((BoardContext->Size == NULL) || BoardContext->SizeFound)) {
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+STATIC
+VOID
+GetBaseboardInfo(
+  OUT CHAR8 *BoardModel,
+  IN UINTN  BoardModelSize,
+  OUT CHAR8 *BoardSize,
+  IN UINTN  BoardSizeSize
+  )
+{
+  BOOLEAN NeedModel = (BoardModel != NULL) && (BoardModelSize > 0);
+  BOOLEAN NeedSize  = (BoardSize != NULL) && (BoardSizeSize > 0);
+
+  if (NeedModel) {
+    BoardModel[0] = '\0';
+  }
+
+  if (NeedSize) {
+    BoardSize[0] = '\0';
+  }
+
+  if (!NeedModel && !NeedSize) {
+    return;
+  }
+
+  BASEBOARD_INFO_CONTEXT Context;
+  ZeroMem(&Context, sizeof(Context));
+  Context.Model     = NeedModel ? BoardModel : NULL;
+  Context.ModelSize = BoardModelSize;
+  Context.Size      = NeedSize ? BoardSize : NULL;
+  Context.SizeSize  = BoardSizeSize;
+
+  EFI_SMBIOS_PROTOCOL *Smbios = NULL;
+  EFI_STATUS           Status = gBS->LocateProtocol(&gEfiSmbiosProtocolGuid, NULL, (VOID **)&Smbios);
+  if (!EFI_ERROR(Status) && (Smbios != NULL)) {
+    EFI_SMBIOS_HANDLE       Handle = SMBIOS_HANDLE_PI_RESERVED;
+    EFI_SMBIOS_TABLE_HEADER *Record;
+
+    while (TRUE) {
+      Status = Smbios->GetNext(Smbios, &Handle, NULL, &Record, NULL);
+      if (EFI_ERROR(Status)) {
+        break;
+      }
+
+      if (Record == NULL) {
+        continue;
+      }
+
+      UpdateBaseboardInfoFromRecord((CONST SMBIOS_STRUCTURE *)Record, &Context);
+
+      if (((!NeedModel) || Context.ModelFound) && ((!NeedSize) || Context.SizeFound)) {
+        break;
+      }
+    }
+  }
+
+  if ((NeedModel && !Context.ModelFound) || (NeedSize && !Context.SizeFound)) {
+    CONST UINT8 *RawTable  = NULL;
+    UINTN        RawLength = 0;
+
+    Status = GetSmbiosRawTable(&RawTable, &RawLength);
+    if (!EFI_ERROR(Status) && (RawTable != NULL) && (RawLength != 0)) {
+      EnumerateRawSmbiosTable(RawTable, RawLength, BaseboardInfoVisitor, &Context);
+    }
+  }
+
+  if (NeedModel && ((BoardModel[0] == '\0') || !Context.ModelFound)) {
+    AsciiStrCpyS(BoardModel, BoardModelSize, UNKNOWN_STRING);
+  }
+
+  if (NeedSize && ((BoardSize[0] == '\0') || !Context.SizeFound)) {
+    AsciiStrCpyS(BoardSize, BoardSizeSize, UNKNOWN_STRING);
+  }
+}
+
+STATIC
+CONST CHAR8 *
+GetMemoryTypeDescription(
+  IN UINT8 MemoryType
+  )
+{
+  switch (MemoryType) {
+    case MemoryTypeOther:
+      return "Other";
+    case MemoryTypeUnknown:
+      return "Unknown";
+    case MemoryTypeDram:
+      return "DRAM";
+    case MemoryTypeEdram:
+      return "EDRAM";
+    case MemoryTypeVram:
+      return "VRAM";
+    case MemoryTypeSram:
+      return "SRAM";
+    case MemoryTypeRam:
+      return "RAM";
+    case MemoryTypeRom:
+      return "ROM";
+    case MemoryTypeFlash:
+      return "Flash";
+    case MemoryTypeEeprom:
+      return "EEPROM";
+    case MemoryTypeFeprom:
+      return "FEPROM";
+    case MemoryTypeEprom:
+      return "EPROM";
+    case MemoryTypeCdram:
+      return "CDRAM";
+    case MemoryType3Dram:
+      return "3DRAM";
+    case MemoryTypeSdram:
+      return "SDRAM";
+    case MemoryTypeSgram:
+      return "SGRAM";
+    case MemoryTypeRdram:
+      return "RDRAM";
+    case MemoryTypeDdr:
+      return "DDR";
+    case MemoryTypeDdr2:
+      return "DDR2";
+    case MemoryTypeDdr2FbDimm:
+      return "DDR2 FB-DIMM";
+    case MemoryTypeDdr3:
+      return "DDR3";
+    case MemoryTypeFbd2:
+      return "FBD2";
+    case MemoryTypeDdr4:
+      return "DDR4";
+    case MemoryTypeDdr5:
+      return "DDR5";
+    case MemoryTypeLpddr:
+      return "LPDDR";
+    case MemoryTypeLpddr2:
+      return "LPDDR2";
+    case MemoryTypeLpddr3:
+      return "LPDDR3";
+    case MemoryTypeLpddr4:
+      return "LPDDR4";
+    case MemoryTypeLpddr5:
+      return "LPDDR5";
+    case MemoryTypeLogicalNonVolatileDevice:
+      return "Logical Non-Volatile Device";
+    case MemoryTypeHBM:
+      return "HBM";
+    case MemoryTypeHBM2:
+      return "HBM2";
+    default:
+      return NULL;
+  }
+}
+
+STATIC
+UINT64
+GetMemoryDeviceSizeInBytes(
+  IN CONST SMBIOS_TABLE_TYPE17 *Type17,
+  IN UINTN                      RecordLength
+  )
+{
+  if (Type17 == NULL) {
+    return 0;
+  }
+
+  if (RecordLength < (OFFSET_OF(SMBIOS_TABLE_TYPE17, Size) + sizeof(Type17->Size))) {
+    return 0;
+  }
+
+  UINT16 SizeField = Type17->Size;
+
+  if ((SizeField == 0) || (SizeField == 0xFFFF)) {
+    return 0;
+  }
+
+  if (SizeField == 0x7FFF) {
+    if (RecordLength < (OFFSET_OF(SMBIOS_TABLE_TYPE17, ExtendedSize) + sizeof(Type17->ExtendedSize))) {
+      return 0;
+    }
+
+    UINT32 ExtendedSizeMb = Type17->ExtendedSize;
+    if (ExtendedSizeMb == 0) {
+      return 0;
+    }
+
+    return (UINT64)ExtendedSizeMb * 1024ULL * 1024ULL;
+  }
+
+  if ((SizeField & 0x8000) != 0) {
+    UINT16 Kilobytes = SizeField & 0x7FFF;
+    if (Kilobytes == 0) {
+      return 0;
+    }
+
+    return (UINT64)Kilobytes * 1024ULL;
+  }
+
+  return (UINT64)SizeField * 1024ULL * 1024ULL;
+}
+
+typedef struct {
+  CHAR8   *Model;
+  UINTN    ModelSize;
+  CHAR8   *Size;
+  UINTN    SizeSize;
+  BOOLEAN  ModelFound;
+  BOOLEAN  SizeFound;
+  BOOLEAN  AnyDevicePresent;
+  UINT64   TotalSizeBytes;
+} MEMORY_INFO_CONTEXT;
+
+STATIC
+VOID
+UpdateMemoryInfoFromRecord(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT MEMORY_INFO_CONTEXT *Context
+  )
+{
+  if ((Record == NULL) || (Context == NULL) || (Record->Type != SMBIOS_TYPE_MEMORY_DEVICE)) {
+    return;
+  }
+
+  Context->AnyDevicePresent = TRUE;
+
+  CONST SMBIOS_TABLE_TYPE17 *Type17 = (CONST SMBIOS_TABLE_TYPE17 *)Record;
+
+  UINT64 ModuleSizeBytes = GetMemoryDeviceSizeInBytes(Type17, Record->Length);
+  if (ModuleSizeBytes > 0) {
+    Context->TotalSizeBytes += ModuleSizeBytes;
+  }
+
+  if ((Context->Model != NULL) && !Context->ModelFound) {
+    if ((UINTN)Record->Length > OFFSET_OF(SMBIOS_TABLE_TYPE17, PartNumber)) {
+      SMBIOS_TABLE_STRING PartNumber = Type17->PartNumber;
+      if (PartNumber != 0) {
+        CHAR8 Temp[HARDWARE_MODEL_BUFFER_LENGTH];
+        ZeroMem(Temp, sizeof(Temp));
+        CopySmbiosString(Temp, sizeof(Temp), Record, PartNumber);
+        NormalizeAsciiString(Temp);
+        if (Temp[0] != '\0') {
+          AsciiStrCpyS(Context->Model, Context->ModelSize, Temp);
+          Context->ModelFound = TRUE;
+        }
+      }
+    }
+  }
+
+  if ((Context->Model != NULL) && !Context->ModelFound) {
+    CONST CHAR8 *Description = GetMemoryTypeDescription(Type17->MemoryType);
+    if ((Description != NULL) && (Description[0] != '\0')) {
+      AsciiStrCpyS(Context->Model, Context->ModelSize, Description);
+      Context->ModelFound = TRUE;
+    }
+  }
+}
+
+STATIC
+BOOLEAN
+MemoryInfoVisitor(
+  IN CONST SMBIOS_STRUCTURE *Record,
+  IN OUT VOID               *Context
+  )
+{
+  UpdateMemoryInfoFromRecord(Record, (MEMORY_INFO_CONTEXT *)Context);
+  return TRUE;
+}
+
+STATIC
+VOID
+FormatSizeString(
+  OUT CHAR8 *Buffer,
+  IN UINTN   BufferSize,
+  IN UINT64  SizeInBytes
+  )
+{
+  if ((Buffer == NULL) || (BufferSize == 0)) {
+    return;
+  }
+
+  if (SizeInBytes == 0) {
+    Buffer[0] = '\0';
+    return;
+  }
+
+  CONST UINT64 OneKilobyte = 1024ULL;
+  CONST UINT64 OneMegabyte = OneKilobyte * 1024ULL;
+  CONST UINT64 OneGigabyte = OneMegabyte * 1024ULL;
+
+  if (SizeInBytes >= OneGigabyte) {
+    UINT64 Gigabytes = SizeInBytes / OneGigabyte;
+    UINT64 Remainder = SizeInBytes % OneGigabyte;
+    if (Remainder == 0) {
+      AsciiSPrint(Buffer, BufferSize, "%Lu GB", Gigabytes);
+      return;
+    }
+  }
+
+  if (SizeInBytes >= OneMegabyte) {
+    UINT64 Megabytes = SizeInBytes / OneMegabyte;
+    AsciiSPrint(Buffer, BufferSize, "%Lu MB", Megabytes);
+    return;
+  }
+
+  UINT64 Kilobytes = SizeInBytes / OneKilobyte;
+  if (Kilobytes == 0) {
+    Kilobytes = 1;
+  }
+
+  AsciiSPrint(Buffer, BufferSize, "%Lu KB", Kilobytes);
+}
+
+STATIC
+VOID
+GetMemoryInfo(
+  OUT CHAR8 *MemoryModel,
+  IN UINTN  MemoryModelSize,
+  OUT CHAR8 *MemorySize,
+  IN UINTN  MemorySizeSize
+  )
+{
+  BOOLEAN NeedModel = (MemoryModel != NULL) && (MemoryModelSize > 0);
+  BOOLEAN NeedSize  = (MemorySize != NULL) && (MemorySizeSize > 0);
+
+  if (NeedModel) {
+    MemoryModel[0] = '\0';
+  }
+
+  if (NeedSize) {
+    MemorySize[0] = '\0';
+  }
+
+  if (!NeedModel && !NeedSize) {
+    return;
+  }
+
+  MEMORY_INFO_CONTEXT Context;
+  ZeroMem(&Context, sizeof(Context));
+  Context.Model     = NeedModel ? MemoryModel : NULL;
+  Context.ModelSize = MemoryModelSize;
+  Context.Size      = NeedSize ? MemorySize : NULL;
+  Context.SizeSize  = MemorySizeSize;
+
+  EFI_SMBIOS_PROTOCOL *Smbios = NULL;
+  EFI_STATUS           Status = gBS->LocateProtocol(&gEfiSmbiosProtocolGuid, NULL, (VOID **)&Smbios);
+  if (!EFI_ERROR(Status) && (Smbios != NULL)) {
+    EFI_SMBIOS_HANDLE       Handle = SMBIOS_HANDLE_PI_RESERVED;
+    EFI_SMBIOS_TABLE_HEADER *Record;
+
+    while (TRUE) {
+      Status = Smbios->GetNext(Smbios, &Handle, NULL, &Record, NULL);
+      if (EFI_ERROR(Status)) {
+        break;
+      }
+
+      if (Record == NULL) {
+        continue;
+      }
+
+      UpdateMemoryInfoFromRecord((CONST SMBIOS_STRUCTURE *)Record, &Context);
+    }
+  }
+
+  if (!Context.AnyDevicePresent) {
+    CONST UINT8 *RawTable  = NULL;
+    UINTN        RawLength = 0;
+
+    Status = GetSmbiosRawTable(&RawTable, &RawLength);
+    if (!EFI_ERROR(Status) && (RawTable != NULL) && (RawLength != 0)) {
+      EnumerateRawSmbiosTable(RawTable, RawLength, MemoryInfoVisitor, &Context);
+    }
+  }
+
+  if (NeedSize && (Context.TotalSizeBytes > 0)) {
+    FormatSizeString(MemorySize, MemorySizeSize, Context.TotalSizeBytes);
+    Context.SizeFound = TRUE;
+  }
+
+  if (NeedModel && ((MemoryModel[0] == '\0') || !Context.ModelFound)) {
+    AsciiStrCpyS(MemoryModel, MemoryModelSize, UNKNOWN_STRING);
+  }
+
+  if (NeedSize && ((MemorySize[0] == '\0') || (Context.TotalSizeBytes == 0))) {
+    AsciiStrCpyS(MemorySize, MemorySizeSize, UNKNOWN_STRING);
+  }
 }
