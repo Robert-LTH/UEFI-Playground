@@ -30,6 +30,16 @@
 #define SERIAL_NUMBER_BUFFER_LENGTH     (COMPUTER_INFO_QR_MAX_DATA_LENGTH + 1)
 #define UNKNOWN_STRING                  "UNKNOWN"
 #define DHCP_OPTION_PAD                 0
+#define DHCP_OPTION_SUBNET_MASK         1
+#define DHCP_OPTION_ROUTER              3
+#define DHCP_OPTION_DNS_SERVERS         6
+#define DHCP_OPTION_DOMAIN_NAME         15
+#define DHCP_OPTION_BROADCAST_ADDRESS   28
+#define DHCP_OPTION_IP_ADDRESS_LEASE_TIME  51
+#define DHCP_OPTION_SERVER_IDENTIFIER   54
+#define DHCP_OPTION_PARAMETER_REQUEST_LIST  55
+#define DHCP_OPTION_RENEWAL_T1_TIME     58
+#define DHCP_OPTION_REBINDING_T2_TIME   59
 #define DHCP_OPTION_END                 255
 #define COMPUTER_INFO_QR_SERVER_URL_OPTION  224
 #define DHCP_OPTION_MAX_LENGTH              255
@@ -45,6 +55,14 @@ STATIC
 EFI_STATUS
 InitializeNicOnHandle(
   IN EFI_HANDLE Handle
+  );
+
+STATIC
+EFI_STATUS
+StartDhcpClientIfStopped(
+  IN     EFI_DHCP4_PROTOCOL *Dhcp4,
+  IN OUT EFI_DHCP4_MODE_DATA *ModeData,
+  OUT    BOOLEAN            *ClientStarted OPTIONAL
   );
 
 STATIC
@@ -845,7 +863,22 @@ GetServerUrlFromDhcp(
     }
 
     Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
-    if (EFI_ERROR(Status) || (ModeData.ReplyPacket == NULL)) {
+    if (EFI_ERROR(Status)) {
+      continue;
+    }
+
+    EFI_DHCP4_STATE OriginalState = ModeData.State;
+    Status = StartDhcpClientIfStopped(Dhcp4, &ModeData, NULL);
+    if (EFI_ERROR(Status)) {
+      if ((Result == EFI_NOT_FOUND) && (Status != EFI_NOT_FOUND)) {
+        Result = Status;
+      }
+      if (OriginalState == Dhcp4Stopped) {
+        continue;
+      }
+    }
+
+    if (ModeData.ReplyPacket == NULL) {
       continue;
     }
 
@@ -1265,6 +1298,96 @@ LocateDhcp4Handles(
 
 STATIC
 EFI_STATUS
+StartDhcpClientIfStopped(
+  IN     EFI_DHCP4_PROTOCOL *Dhcp4,
+  IN OUT EFI_DHCP4_MODE_DATA *ModeData,
+  OUT    BOOLEAN            *ClientStarted OPTIONAL
+  )
+{
+  if ((Dhcp4 == NULL) || (ModeData == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (ModeData->State != Dhcp4Stopped) {
+    return EFI_SUCCESS;
+  }
+
+  if (Dhcp4->Start == NULL) {
+    return EFI_UNSUPPORTED;
+  }
+
+  EFI_STATUS Status = Dhcp4->Start(Dhcp4, NULL);
+
+  if (Status == EFI_NOT_STARTED) {
+    if (Dhcp4->Configure == NULL) {
+      return EFI_UNSUPPORTED;
+    }
+
+    EFI_DHCP4_CONFIG_DATA ConfigData;
+    ZeroMem(&ConfigData, sizeof(ConfigData));
+
+    CONST UINT8 RequestedOptions[] = {
+      DHCP_OPTION_SUBNET_MASK,
+      DHCP_OPTION_ROUTER,
+      DHCP_OPTION_DNS_SERVERS,
+      DHCP_OPTION_DOMAIN_NAME,
+      DHCP_OPTION_BROADCAST_ADDRESS,
+      DHCP_OPTION_IP_ADDRESS_LEASE_TIME,
+      DHCP_OPTION_SERVER_IDENTIFIER,
+      DHCP_OPTION_RENEWAL_T1_TIME,
+      DHCP_OPTION_REBINDING_T2_TIME,
+      COMPUTER_INFO_QR_SERVER_URL_OPTION
+    };
+
+    UINT8 ParameterRequestBuffer[sizeof(EFI_DHCP4_PACKET_OPTION) + sizeof(RequestedOptions) - 1];
+    EFI_DHCP4_PACKET_OPTION *ParameterRequestList = (EFI_DHCP4_PACKET_OPTION *)ParameterRequestBuffer;
+    ZeroMem(ParameterRequestBuffer, sizeof(ParameterRequestBuffer));
+
+    ParameterRequestList->OpCode = DHCP_OPTION_PARAMETER_REQUEST_LIST;
+    ParameterRequestList->Length = (UINT8)sizeof(RequestedOptions);
+    CopyMem(ParameterRequestList->Data, RequestedOptions, sizeof(RequestedOptions));
+
+    EFI_DHCP4_PACKET_OPTION *OptionList[1];
+    OptionList[0] = ParameterRequestList;
+
+    ConfigData.OptionCount = 1;
+    ConfigData.OptionList  = OptionList;
+
+    Status = Dhcp4->Configure(Dhcp4, &ConfigData);
+    if (EFI_ERROR(Status)) {
+      return Status;
+    }
+
+    Status = Dhcp4->Start(Dhcp4, NULL);
+  }
+
+  if (Status == EFI_ALREADY_STARTED) {
+    Status = EFI_SUCCESS;
+  }
+
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  if (ClientStarted != NULL) {
+    *ClientStarted = TRUE;
+  }
+
+  if (Dhcp4->GetModeData == NULL) {
+    return EFI_UNSUPPORTED;
+  }
+
+  ZeroMem(ModeData, sizeof(*ModeData));
+  Status = Dhcp4->GetModeData(Dhcp4, ModeData);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
 InitializeNicOnHandle(
   IN EFI_HANDLE Handle
   )
@@ -1377,6 +1500,12 @@ DisplayDhcpInterfaceInformation(
   if (EFI_ERROR(Status)) {
     Print(L"  GetModeData failed: %r\n\n", Status);
     return;
+  }
+
+  EFI_DHCP4_STATE OriginalState = ModeData.State;
+  Status = StartDhcpClientIfStopped(Dhcp4, &ModeData, NULL);
+  if (EFI_ERROR(Status) && (OriginalState == Dhcp4Stopped)) {
+    Print(L"  Unable to start DHCP client: %r\n", Status);
   }
 
   Print(L"  State: %s (%u)\n", Dhcp4StateToString(ModeData.State), (UINT32)ModeData.State);
@@ -1516,32 +1645,13 @@ RenewDhcpLeaseOnHandle(
     return Status;
   }
 
-  BOOLEAN AttemptedStart = FALSE;
+  Status = StartDhcpClientIfStopped(Dhcp4, &ModeData, ClientStarted);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
 
-  while (ModeData.State == Dhcp4Stopped) {
-    if (AttemptedStart) {
-      return EFI_DEVICE_ERROR;
-    }
-
-    if (Dhcp4->Start == NULL) {
-      return EFI_UNSUPPORTED;
-    }
-
-    Status = Dhcp4->Start(Dhcp4, NULL);
-    if (EFI_ERROR(Status)) {
-      return Status;
-    }
-
-    AttemptedStart = TRUE;
-    if (ClientStarted != NULL) {
-      *ClientStarted = TRUE;
-    }
-
-    ZeroMem(&ModeData, sizeof(ModeData));
-    Status = Dhcp4->GetModeData(Dhcp4, &ModeData);
-    if (EFI_ERROR(Status)) {
-      return Status;
-    }
+  if (ModeData.State == Dhcp4Stopped) {
+    return EFI_DEVICE_ERROR;
   }
 
   switch (ModeData.State) {
