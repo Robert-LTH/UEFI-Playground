@@ -2,6 +2,7 @@
 
 #include <Library/BaseMemoryLib.h>
 #include <Library/BaseLib.h>
+#include <Library/MemoryAllocationLib.h>
 
 #define GF_SIZE                       256
 #define GF_GENERATOR_POLYNOMIAL       0x11D
@@ -407,6 +408,11 @@ BuildCodewordSequence(
   OUT UINT8       *Codewords
   )
 {
+  EFI_STATUS Status;
+  UINT8 (*Blocks)[COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS] = NULL;
+  UINTN *BlockLengths = NULL;
+  UINT8 *Parity = NULL;
+
   if ((DataCodewords == NULL) || (Codewords == NULL) ||
       (NumBlocks == 0) || (EccCodewordsPerBlock == 0) ||
       (NumBlocks > COMPUTER_INFO_QR_MAX_ERROR_CORRECTION_BLOCKS) ||
@@ -434,8 +440,23 @@ BuildCodewordSequence(
     return EFI_BAD_BUFFER_SIZE;
   }
 
-  UINT8 Blocks[COMPUTER_INFO_QR_MAX_ERROR_CORRECTION_BLOCKS][COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS];
-  UINTN BlockLengths[COMPUTER_INFO_QR_MAX_ERROR_CORRECTION_BLOCKS];
+  Blocks = AllocateZeroPool(NumBlocks * sizeof(Blocks[0]));
+  if (Blocks == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
+
+  BlockLengths = AllocateZeroPool(NumBlocks * sizeof(BlockLengths[0]));
+  if (BlockLengths == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
+
+  Parity = AllocateZeroPool(EccCodewordsPerBlock * sizeof(UINT8));
+  if (Parity == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
 
   UINTN Offset = 0;
   for (UINTN BlockIndex = 0; BlockIndex < NumBlocks; BlockIndex++) {
@@ -445,7 +466,6 @@ BuildCodewordSequence(
     CopyMem(Blocks[BlockIndex], DataCodewords + Offset, DataLength);
     Offset += DataLength;
 
-    UINT8 Parity[COMPUTER_INFO_QR_MAX_ECC_CODEWORDS_PER_BLOCK];
     ComputeReedSolomon(
       Blocks[BlockIndex],
       DataLength,
@@ -463,7 +483,8 @@ BuildCodewordSequence(
   }
 
   if (Offset != DataCodewordCount) {
-    return EFI_BAD_BUFFER_SIZE;
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Cleanup;
   }
 
   UINTN BlockLength = BlockLengths[0];
@@ -482,10 +503,24 @@ BuildCodewordSequence(
   }
 
   if (CodewordIndex != TotalCodewords) {
-    return EFI_BAD_BUFFER_SIZE;
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Cleanup;
   }
 
-  return EFI_SUCCESS;
+  Status = EFI_SUCCESS;
+
+Cleanup:
+  if (Parity != NULL) {
+    FreePool(Parity);
+  }
+  if (BlockLengths != NULL) {
+    FreePool(BlockLengths);
+  }
+  if (Blocks != NULL) {
+    FreePool(Blocks);
+  }
+
+  return Status;
 }
 
 STATIC
@@ -963,6 +998,16 @@ GenerateComputerInfoQrCode(
   OUT COMPUTER_INFO_QR_CODE *QrCode
   )
 {
+  EFI_STATUS               Status;
+  UINT8                    *DataCodewords        = NULL;
+  UINT8                    *Codewords            = NULL;
+  UINT8                    *DataBits             = NULL;
+  QR_MODULE_MATRIX         *BaseModules          = NULL;
+  QR_FUNCTION_MATRIX       *FunctionModules      = NULL;
+  QR_MODULE_MATRIX         *BestModules          = NULL;
+  QR_MODULE_MATRIX         *MaskedModules        = NULL;
+  QR_FUNCTION_MATRIX       *MaskedFunction       = NULL;
+
   if ((Payload == NULL) || (QrCode == NULL)) {
     return EFI_INVALID_PARAMETER;
   }
@@ -997,13 +1042,24 @@ GenerateComputerInfoQrCode(
   UINTN AlignmentCount;
   GetAlignmentPatternCenters(SelectedVersion, AlignmentCenters, &AlignmentCount);
 
-  UINT8 DataCodewords[COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH];
-  EFI_STATUS Status = BuildDataCodewords(Payload, PayloadLength, DataCodewords, DataCapacity);
-  if (EFI_ERROR(Status)) {
-    return Status;
+  UINTN TotalDataBits = TotalCodewords * 8 + RemainderBits;
+  DataCodewords = AllocateZeroPool(COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH);
+  if (DataCodewords == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
   }
 
-  UINT8 Codewords[COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS];
+  Status = BuildDataCodewords(Payload, PayloadLength, DataCodewords, DataCapacity);
+  if (EFI_ERROR(Status)) {
+    goto Cleanup;
+  }
+
+  Codewords = AllocateZeroPool(COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS);
+  if (Codewords == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
+
   Status = BuildCodewordSequence(
              DataCodewords,
              DataCapacity,
@@ -1013,11 +1069,15 @@ GenerateComputerInfoQrCode(
              Codewords
              );
   if (EFI_ERROR(Status)) {
-    return Status;
+    goto Cleanup;
   }
 
-  UINTN TotalDataBits = TotalCodewords * 8 + RemainderBits;
-  UINT8 DataBits[COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS * 8 + 7];
+  DataBits = AllocateZeroPool(COMPUTER_INFO_QR_MAX_TOTAL_CODEWORDS * 8 + 7);
+  if (DataBits == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
+
   for (UINTN Bit = 0; Bit < TotalCodewords * 8; Bit++) {
     UINT8 Byte = Codewords[Bit / 8];
     DataBits[Bit] = (UINT8)((Byte >> (7 - (Bit % 8))) & 0x1);
@@ -1026,51 +1086,100 @@ GenerateComputerInfoQrCode(
     DataBits[Bit] = 0;
   }
 
-  QR_MODULE_MATRIX BaseModules;
-  QR_FUNCTION_MATRIX FunctionModules;
-  ZeroMem(BaseModules, sizeof(BaseModules));
-  ZeroMem(FunctionModules, sizeof(FunctionModules));
+  BaseModules = AllocateZeroPool(sizeof(*BaseModules));
+  if (BaseModules == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
 
-  DrawFinderPattern(BaseModules, FunctionModules, 0, 0, Size);
-  DrawFinderPattern(BaseModules, FunctionModules, (INTN)Size - 7, 0, Size);
-  DrawFinderPattern(BaseModules, FunctionModules, 0, (INTN)Size - 7, Size);
+  FunctionModules = AllocateZeroPool(sizeof(*FunctionModules));
+  if (FunctionModules == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
 
-  DrawTimingPatterns(BaseModules, FunctionModules, Size);
+  DrawFinderPattern(*BaseModules, *FunctionModules, 0, 0, Size);
+  DrawFinderPattern(*BaseModules, *FunctionModules, (INTN)Size - 7, 0, Size);
+  DrawFinderPattern(*BaseModules, *FunctionModules, 0, (INTN)Size - 7, Size);
 
-  DrawAlignmentPatterns(BaseModules, FunctionModules, AlignmentCenters, AlignmentCount, Size);
+  DrawTimingPatterns(*BaseModules, *FunctionModules, Size);
 
-  ReserveFormatInfo(FunctionModules, Size);
-  DrawVersionInformation(BaseModules, FunctionModules, SelectedVersion, Size);
+  DrawAlignmentPatterns(*BaseModules, *FunctionModules, AlignmentCenters, AlignmentCount, Size);
 
-  BaseModules[(INTN)Size - 8][8] = 1;
-  FunctionModules[(INTN)Size - 8][8] = TRUE;
+  ReserveFormatInfo(*FunctionModules, Size);
+  DrawVersionInformation(*BaseModules, *FunctionModules, SelectedVersion, Size);
 
-  PlaceDataBits(BaseModules, FunctionModules, DataBits, TotalDataBits, Size);
+  (*BaseModules)[(INTN)Size - 8][8] = 1;
+  (*FunctionModules)[(INTN)Size - 8][8] = TRUE;
+
+  PlaceDataBits(*BaseModules, *FunctionModules, DataBits, TotalDataBits, Size);
 
   INT32 BestPenalty = MAX_INT32;
-  QR_MODULE_MATRIX BestModules;
-  ZeroMem(BestModules, sizeof(BestModules));
+
+  BestModules = AllocateZeroPool(sizeof(*BestModules));
+  if (BestModules == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
+
+  MaskedModules = AllocateZeroPool(sizeof(*MaskedModules));
+  if (MaskedModules == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
+
+  MaskedFunction = AllocateZeroPool(sizeof(*MaskedFunction));
+  if (MaskedFunction == NULL) {
+    Status = EFI_OUT_OF_RESOURCES;
+    goto Cleanup;
+  }
 
   for (UINTN Mask = 0; Mask < 8; Mask++) {
-    QR_MODULE_MATRIX MaskedModules;
-    QR_FUNCTION_MATRIX MaskedFunction;
-    CopyMem(MaskedModules, BaseModules, sizeof(BaseModules));
-    CopyMem(MaskedFunction, FunctionModules, sizeof(FunctionModules));
+    CopyMem(*MaskedModules, *BaseModules, sizeof(*BaseModules));
+    CopyMem(*MaskedFunction, *FunctionModules, sizeof(*FunctionModules));
 
-    ApplyMask(MaskedModules, MaskedFunction, Mask, Size);
-    DrawFormatBits(MaskedModules, MaskedFunction, Mask, Size);
+    ApplyMask(*MaskedModules, *MaskedFunction, Mask, Size);
+    DrawFormatBits(*MaskedModules, *MaskedFunction, Mask, Size);
 
-    INT32 Penalty = EvaluatePenalty(MaskedModules, Size);
+    INT32 Penalty = EvaluatePenalty(*MaskedModules, Size);
     if (Penalty < BestPenalty) {
       BestPenalty = Penalty;
-      CopyMem(BestModules, MaskedModules, sizeof(BestModules));
+      CopyMem(*BestModules, *MaskedModules, sizeof(*BestModules));
     }
   }
 
   for (UINTN Y = 0; Y < Size; Y++) {
-    CopyMem(QrCode->Modules[Y], BestModules[Y], Size * sizeof(UINT8));
+    CopyMem(QrCode->Modules[Y], (*BestModules)[Y], Size * sizeof(UINT8));
   }
 
   QrCode->Size = Size;
-  return EFI_SUCCESS;
+  Status = EFI_SUCCESS;
+
+Cleanup:
+  if (MaskedFunction != NULL) {
+    FreePool(MaskedFunction);
+  }
+  if (MaskedModules != NULL) {
+    FreePool(MaskedModules);
+  }
+  if (BestModules != NULL) {
+    FreePool(BestModules);
+  }
+  if (FunctionModules != NULL) {
+    FreePool(FunctionModules);
+  }
+  if (BaseModules != NULL) {
+    FreePool(BaseModules);
+  }
+  if (DataBits != NULL) {
+    FreePool(DataBits);
+  }
+  if (Codewords != NULL) {
+    FreePool(Codewords);
+  }
+  if (DataCodewords != NULL) {
+    FreePool(DataCodewords);
+  }
+
+  return Status;
 }
