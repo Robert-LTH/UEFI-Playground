@@ -90,6 +90,33 @@ IsValidUuid(
   );
 
 STATIC
+VOID
+GetCpuInfo(
+  OUT CHAR8 *CpuModel,
+  IN UINTN  CpuModelSize,
+  OUT CHAR8 *CpuSize,
+  IN UINTN  CpuSizeSize
+  );
+
+STATIC
+VOID
+GetBaseboardInfo(
+  OUT CHAR8 *BoardModel,
+  IN UINTN  BoardModelSize,
+  OUT CHAR8 *BoardSize,
+  IN UINTN  BoardSizeSize
+  );
+
+STATIC
+VOID
+GetMemoryInfo(
+  OUT CHAR8 *MemoryModel,
+  IN UINTN  MemoryModelSize,
+  OUT CHAR8 *MemorySize,
+  IN UINTN  MemorySizeSize
+  );
+
+STATIC
 BOOLEAN
 IsAsciiSpaceCharacter(
   IN CHAR8 Character
