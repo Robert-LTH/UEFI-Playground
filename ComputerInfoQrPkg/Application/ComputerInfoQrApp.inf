@@ -38,6 +38,7 @@
   gEfiHttpProtocolGuid
   gEfiHttpServiceBindingProtocolGuid
   gEfiSimpleNetworkProtocolGuid
+  gEfiPciIoProtocolGuid
   gEfiSmbiosProtocolGuid
 
 [Guids]
