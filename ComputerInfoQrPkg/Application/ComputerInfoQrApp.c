@@ -116,6 +116,18 @@ StartDhcpClientIfStopped(
   );
 
 STATIC
+VOID
+PrintDhcpOutgoingOptions(
+  IN CONST EFI_DHCP4_CONFIG_DATA *ConfigData
+  );
+
+STATIC
+VOID
+TriggerDhcpRequestOnStartup(
+  VOID
+  );
+
+STATIC
 EFI_STATUS
 BuildHardwareInventoryPayload(
   OUT CHAR8 **JsonPayload,
@@ -1773,6 +1785,64 @@ PauseWithPrompt(
 
 STATIC
 VOID
+PrintDhcpOptionDetails(
+  IN CONST CHAR16 *Indent,
+  IN UINT8         OptionCode,
+  IN CONST UINT8  *OptionData,
+  IN UINTN         OptionLength
+  )
+{
+  CONST CHAR16 *Prefix = Indent;
+
+  if (Prefix == NULL) {
+    Prefix = L"";
+  }
+
+  Print(
+    L"%sOption %u (0x%02X), length %u\n",
+    Prefix,
+    (UINT32)OptionCode,
+    (UINT32)OptionCode,
+    (UINT32)OptionLength
+    );
+
+  if (OptionLength == 0) {
+    Print(L"%s  Data: (none)\n", Prefix);
+    return;
+  }
+
+  if (OptionData == NULL) {
+    Print(L"%s  Data: (unavailable)\n", Prefix);
+    return;
+  }
+
+  Print(L"%s  Data:", Prefix);
+  for (UINTN ByteIndex = 0; ByteIndex < OptionLength; ByteIndex++) {
+    Print(L" %02X", (UINT32)OptionData[ByteIndex]);
+  }
+  Print(L"\n");
+
+  UINTN CopyLength = OptionLength;
+  if (CopyLength > DHCP_OPTION_MAX_LENGTH) {
+    CopyLength = DHCP_OPTION_MAX_LENGTH;
+  }
+
+  CHAR16 AsciiBuffer[DHCP_OPTION_MAX_LENGTH + 1];
+  for (UINTN ByteIndex = 0; ByteIndex < CopyLength; ByteIndex++) {
+    CHAR8 Value = (CHAR8)OptionData[ByteIndex];
+    if ((Value >= 0x20) && (Value <= 0x7E)) {
+      AsciiBuffer[ByteIndex] = (CHAR16)Value;
+    } else {
+      AsciiBuffer[ByteIndex] = L'.';
+    }
+  }
+  AsciiBuffer[CopyLength] = L'\0';
+
+  Print(L"%s  ASCII: %s\n", Prefix, AsciiBuffer);
+}
+
+STATIC
+VOID
 PrintDhcpOptions(
   IN CONST EFI_DHCP4_PACKET *Packet
   )
@@ -1784,7 +1854,6 @@ PrintDhcpOptions(
 
   CONST UINT8 *Option         = Packet->Dhcp4.Option;
   CONST UINT8 *End            = ((CONST UINT8 *)Packet) + Packet->Length;
-  CHAR16       AsciiBuffer[DHCP_OPTION_MAX_LENGTH + 1];
   UINTN        OptionsPrinted = 0;
 
   while (Option < End) {
@@ -1821,39 +1890,44 @@ PrintDhcpOptions(
       break;
     }
 
-    Print(L"    Option %u (0x%02X), length %u\n", (UINT32)OptionCode, (UINT32)OptionCode, (UINT32)OptionLength);
-
-    if (OptionLength == 0) {
-      Print(L"      Data: (none)\n");
-    } else {
-      Print(L"      Data:");
-      for (UINTN ByteIndex = 0; ByteIndex < OptionLength; ByteIndex++) {
-        Print(L" %02X", (UINT32)Option[ByteIndex]);
-      }
-      Print(L"\n");
-
-      UINTN CopyLength = OptionLength;
-      if (CopyLength > DHCP_OPTION_MAX_LENGTH) {
-        CopyLength = DHCP_OPTION_MAX_LENGTH;
-      }
-
-      for (UINTN ByteIndex = 0; ByteIndex < CopyLength; ByteIndex++) {
-        CHAR8 Value = (CHAR8)Option[ByteIndex];
-        if ((Value >= 0x20) && (Value <= 0x7E)) {
-          AsciiBuffer[ByteIndex] = (CHAR16)Value;
-        } else {
-          AsciiBuffer[ByteIndex] = L'.';
-        }
-      }
-      AsciiBuffer[CopyLength] = L'\0';
-
-      Print(L"      ASCII: %s\n", AsciiBuffer);
-    }
+    PrintDhcpOptionDetails(L"    ", OptionCode, Option, OptionLength);
 
     Option += OptionLength;
     OptionsPrinted++;
 
     if (((OptionsPrinted % 4) == 0) && (Option < End)) {
+      PauseWithPrompt(L"    Press any key to view more DHCP options...\n", L"    ");
+    }
+  }
+}
+
+STATIC
+VOID
+PrintDhcpOutgoingOptions(
+  IN CONST EFI_DHCP4_CONFIG_DATA *ConfigData
+  )
+{
+  if ((ConfigData == NULL) || (ConfigData->OptionCount == 0) || (ConfigData->OptionList == NULL)) {
+    Print(L"    No DHCP options configured for outgoing packets.\n");
+    return;
+  }
+
+  Print(L"    Option Count: %u\n", (UINT32)ConfigData->OptionCount);
+
+  UINTN OptionsPrinted = 0;
+
+  for (UINTN Index = 0; Index < ConfigData->OptionCount; Index++) {
+    CONST EFI_DHCP4_PACKET_OPTION *Option = ConfigData->OptionList[Index];
+
+    if (Option == NULL) {
+      Print(L"    Option[%u]: (null entry)\n", (UINT32)Index);
+    } else {
+      PrintDhcpOptionDetails(L"    ", Option->OpCode, Option->Data, Option->Length);
+    }
+
+    OptionsPrinted++;
+
+    if (((OptionsPrinted % 4) == 0) && ((Index + 1) < ConfigData->OptionCount)) {
       PauseWithPrompt(L"    Press any key to view more DHCP options...\n", L"    ");
     }
   }
@@ -2371,6 +2445,9 @@ DisplayDhcpInterfaceInformation(
     Print(L"  Lease Time: %u seconds\n", (UINT32)ModeData.LeaseTime);
   }
 
+  Print(L"  DHCP Outgoing Options:\n");
+  PrintDhcpOutgoingOptions(&ModeData.ConfigData);
+
   if (ModeData.ReplyPacket != NULL) {
     Print(L"  DHCP Reply Packet Length: %u bytes\n", ModeData.ReplyPacket->Length);
     Print(L"  DHCP Transaction ID: 0x%08X\n", ModeData.ReplyPacket->Dhcp4.Header.Xid);
@@ -2584,6 +2661,35 @@ RenewDhcpLeasesFromMenu(
 
   Print(L"Press any key to return to the menu...\n");
   WaitForKeyPress(NULL);
+
+Cleanup:
+  FreeDhcpHandleBuffer(HandleBuffer);
+}
+
+STATIC
+VOID
+TriggerDhcpRequestOnStartup(
+  VOID
+  )
+{
+  EFI_HANDLE *HandleBuffer = NULL;
+  UINTN       HandleCount  = 0;
+  EFI_STATUS  Status;
+
+  Status = LocateDhcp4Handles(&HandleBuffer, &HandleCount);
+  if (EFI_ERROR(Status)) {
+    if (Status != EFI_NOT_FOUND) {
+      Print(L"Unable to locate DHCPv4 interfaces for automatic request: %r\n\n", Status);
+    }
+    goto Cleanup;
+  }
+
+  if ((HandleBuffer == NULL) || (HandleCount == 0)) {
+    goto Cleanup;
+  }
+
+  Print(L"Requesting DHCP configuration for detected network interfaces...\n\n");
+  RenewDhcpLeases(HandleBuffer, HandleCount);
 
 Cleanup:
   FreeDhcpHandleBuffer(HandleBuffer);
@@ -3521,10 +3627,16 @@ UefiMain(
 
   EFI_STATUS ReturnStatus   = EFI_SUCCESS;
   BOOLEAN    ExitRequested  = FALSE;
+  BOOLEAN    DhcpRequested  = FALSE;
 
   while (!ExitRequested) {
     if ((gST != NULL) && (gST->ConOut != NULL)) {
       gST->ConOut->ClearScreen(gST->ConOut);
+    }
+
+    if (!DhcpRequested) {
+      TriggerDhcpRequestOnStartup();
+      DhcpRequested = TRUE;
     }
 
     CHAR16 Selection;
