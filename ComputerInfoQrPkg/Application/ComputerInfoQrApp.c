@@ -49,6 +49,31 @@
 
 STATIC BOOLEAN mWaitForKeyPressSupported = TRUE;
 
+STATIC CONST UINT8 mDhcpParameterRequestOptions[] = {
+  DHCP_OPTION_SUBNET_MASK,
+  DHCP_OPTION_ROUTER,
+  DHCP_OPTION_DNS_SERVERS,
+  DHCP_OPTION_DOMAIN_NAME,
+  DHCP_OPTION_BROADCAST_ADDRESS,
+  DHCP_OPTION_IP_ADDRESS_LEASE_TIME,
+  DHCP_OPTION_SERVER_IDENTIFIER,
+  DHCP_OPTION_RENEWAL_T1_TIME,
+  DHCP_OPTION_REBINDING_T2_TIME,
+  COMPUTER_INFO_QR_SERVER_URL_OPTION
+};
+
+//
+// Persistent storage for the DHCP parameter request option list so the DHCP
+// client can safely reference the data after this module configures it.
+//
+STATIC UINT8 mDhcpParameterRequestBuffer[
+  sizeof(EFI_DHCP4_PACKET_OPTION) + sizeof(mDhcpParameterRequestOptions) - 1
+];
+
+STATIC EFI_DHCP4_PACKET_OPTION *mDhcpParameterRequestOptionList[1];
+
+STATIC BOOLEAN mDhcpParameterRequestListInitialized = FALSE;
+
 STATIC
 EFI_STATUS
 WaitForKeyPress(
@@ -1488,32 +1513,30 @@ StartDhcpClientIfStopped(
     EFI_DHCP4_CONFIG_DATA ConfigData;
     ZeroMem(&ConfigData, sizeof(ConfigData));
 
-    CONST UINT8 RequestedOptions[] = {
-      DHCP_OPTION_SUBNET_MASK,
-      DHCP_OPTION_ROUTER,
-      DHCP_OPTION_DNS_SERVERS,
-      DHCP_OPTION_DOMAIN_NAME,
-      DHCP_OPTION_BROADCAST_ADDRESS,
-      DHCP_OPTION_IP_ADDRESS_LEASE_TIME,
-      DHCP_OPTION_SERVER_IDENTIFIER,
-      DHCP_OPTION_RENEWAL_T1_TIME,
-      DHCP_OPTION_REBINDING_T2_TIME,
-      COMPUTER_INFO_QR_SERVER_URL_OPTION
-    };
+    if (!mDhcpParameterRequestListInitialized) {
+      EFI_DHCP4_PACKET_OPTION *ParameterRequestList;
 
-    UINT8 ParameterRequestBuffer[sizeof(EFI_DHCP4_PACKET_OPTION) + sizeof(RequestedOptions) - 1];
-    EFI_DHCP4_PACKET_OPTION *ParameterRequestList = (EFI_DHCP4_PACKET_OPTION *)ParameterRequestBuffer;
-    ZeroMem(ParameterRequestBuffer, sizeof(ParameterRequestBuffer));
+      ParameterRequestList = (EFI_DHCP4_PACKET_OPTION *)mDhcpParameterRequestBuffer;
 
-    ParameterRequestList->OpCode = DHCP_OPTION_PARAMETER_REQUEST_LIST;
-    ParameterRequestList->Length = (UINT8)sizeof(RequestedOptions);
-    CopyMem(ParameterRequestList->Data, RequestedOptions, sizeof(RequestedOptions));
+      ZeroMem(mDhcpParameterRequestBuffer, sizeof(mDhcpParameterRequestBuffer));
+      ParameterRequestList->OpCode = DHCP_OPTION_PARAMETER_REQUEST_LIST;
+      ParameterRequestList->Length = (UINT8)sizeof(mDhcpParameterRequestOptions);
+      CopyMem(
+        ParameterRequestList->Data,
+        mDhcpParameterRequestOptions,
+        sizeof(mDhcpParameterRequestOptions)
+        );
 
-    EFI_DHCP4_PACKET_OPTION *OptionList[1];
-    OptionList[0] = ParameterRequestList;
+      mDhcpParameterRequestOptionList[0] = ParameterRequestList;
+      mDhcpParameterRequestListInitialized = TRUE;
+    }
+
+    if (mDhcpParameterRequestOptionList[0] == NULL) {
+      return EFI_DEVICE_ERROR;
+    }
 
     ConfigData.OptionCount = 1;
-    ConfigData.OptionList  = OptionList;
+    ConfigData.OptionList  = mDhcpParameterRequestOptionList;
 
     Status = Dhcp4->Configure(Dhcp4, &ConfigData);
     if (EFI_ERROR(Status)) {
