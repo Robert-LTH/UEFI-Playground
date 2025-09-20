@@ -1,0 +1,6 @@
+#ifndef TESTS_STUBS_LIBRARY_BASELIB_H_
+#define TESTS_STUBS_LIBRARY_BASELIB_H_
+
+#include "../Uefi.h"
+
+#endif  // TESTS_STUBS_LIBRARY_BASELIB_H_
