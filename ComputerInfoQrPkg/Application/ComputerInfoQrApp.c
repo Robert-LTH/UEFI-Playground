@@ -47,6 +47,7 @@
 #define DHCP_OPTION_PARAMETER_REQUEST_LIST  55
 #define DHCP_OPTION_RENEWAL_T1_TIME     58
 #define DHCP_OPTION_REBINDING_T2_TIME   59
+#define DHCP_OPTION_CLIENT_IDENTIFIER   61
 #define DHCP_OPTION_END                 255
 #define COMPUTER_INFO_QR_SERVER_URL_OPTION  224
 #define DHCP_OPTION_MAX_LENGTH              255
@@ -78,9 +79,17 @@ STATIC UINT8 mDhcpParameterRequestBuffer[
   sizeof(EFI_DHCP4_PACKET_OPTION) + sizeof(mDhcpParameterRequestOptions) - 1
 ];
 
-STATIC EFI_DHCP4_PACKET_OPTION *mDhcpParameterRequestOptionList[1];
+STATIC CONST CHAR8 mDhcpClientIdentifier[] = "qr-reporter";
 
-STATIC BOOLEAN mDhcpParameterRequestListInitialized = FALSE;
+STATIC UINT8 mDhcpClientIdentifierBuffer[
+  sizeof(EFI_DHCP4_PACKET_OPTION) + sizeof(mDhcpClientIdentifier) - 1
+  ];
+
+STATIC EFI_DHCP4_PACKET_OPTION *mDhcpConfiguredOptions[2];
+
+STATIC UINT32 mDhcpConfiguredOptionCount = 0;
+
+STATIC BOOLEAN mDhcpConfiguredOptionsInitialized = FALSE;
 
 STATIC
 EFI_STATUS
@@ -2218,10 +2227,12 @@ StartDhcpClientIfStopped(
     EFI_DHCP4_CONFIG_DATA ConfigData;
     ZeroMem(&ConfigData, sizeof(ConfigData));
 
-    if (!mDhcpParameterRequestListInitialized) {
+    if (!mDhcpConfiguredOptionsInitialized) {
       EFI_DHCP4_PACKET_OPTION *ParameterRequestList;
+      EFI_DHCP4_PACKET_OPTION *ClientIdentifierOption;
 
       ParameterRequestList = (EFI_DHCP4_PACKET_OPTION *)mDhcpParameterRequestBuffer;
+      ClientIdentifierOption = (EFI_DHCP4_PACKET_OPTION *)mDhcpClientIdentifierBuffer;
 
       ZeroMem(mDhcpParameterRequestBuffer, sizeof(mDhcpParameterRequestBuffer));
       ParameterRequestList->OpCode = DHCP_OPTION_PARAMETER_REQUEST_LIST;
@@ -2232,16 +2243,29 @@ StartDhcpClientIfStopped(
         sizeof(mDhcpParameterRequestOptions)
         );
 
-      mDhcpParameterRequestOptionList[0] = ParameterRequestList;
-      mDhcpParameterRequestListInitialized = TRUE;
+      ZeroMem(mDhcpClientIdentifierBuffer, sizeof(mDhcpClientIdentifierBuffer));
+      ClientIdentifierOption->OpCode = DHCP_OPTION_CLIENT_IDENTIFIER;
+      ClientIdentifierOption->Length = (UINT8)(sizeof(mDhcpClientIdentifier) - 1);
+      CopyMem(
+        ClientIdentifierOption->Data,
+        mDhcpClientIdentifier,
+        ClientIdentifierOption->Length
+        );
+
+      mDhcpConfiguredOptions[0] = ParameterRequestList;
+      mDhcpConfiguredOptions[1] = ClientIdentifierOption;
+      mDhcpConfiguredOptionCount = (UINT32)ARRAY_SIZE(mDhcpConfiguredOptions);
+      mDhcpConfiguredOptionsInitialized = TRUE;
     }
 
-    if (mDhcpParameterRequestOptionList[0] == NULL) {
+    if ((mDhcpConfiguredOptionCount == 0) ||
+        (mDhcpConfiguredOptions[0] == NULL) ||
+        (mDhcpConfiguredOptions[1] == NULL)) {
       return EFI_DEVICE_ERROR;
     }
 
-    ConfigData.OptionCount = 1;
-    ConfigData.OptionList  = mDhcpParameterRequestOptionList;
+    ConfigData.OptionCount = mDhcpConfiguredOptionCount;
+    ConfigData.OptionList  = mDhcpConfiguredOptions;
 
     Status = Dhcp4->Configure(Dhcp4, &ConfigData);
     if (EFI_ERROR(Status)) {
@@ -2560,7 +2584,33 @@ RenewDhcpLeaseOnHandle(
   }
 
   if (Dhcp4->RenewRebind == NULL) {
-    return EFI_UNSUPPORTED;
+    BOOLEAN ClientStartedByRequest = FALSE;
+
+    if (ClientStarted != NULL) {
+      ClientStartedByRequest = *ClientStarted;
+    }
+
+    if (!ClientStartedByRequest && (Dhcp4->Stop != NULL)) {
+      EFI_STATUS StopStatus = Dhcp4->Stop(Dhcp4);
+
+      if (EFI_ERROR(StopStatus) && (StopStatus != EFI_NOT_STARTED)) {
+        if (StopStatus != EFI_UNSUPPORTED) {
+          return StopStatus;
+        }
+      } else {
+        ZeroMem(&ModeData, sizeof(ModeData));
+        ModeData.State = Dhcp4Stopped;
+
+        Status = StartDhcpClientIfStopped(Dhcp4, &ModeData, ClientStarted);
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+
+        return EFI_SUCCESS;
+      }
+    }
+
+    return EFI_SUCCESS;
   }
 
   Status = Dhcp4->RenewRebind(Dhcp4, FALSE, NULL);
