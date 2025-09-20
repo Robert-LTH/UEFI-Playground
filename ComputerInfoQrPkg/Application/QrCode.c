@@ -281,11 +281,20 @@ BuildDataCodewords(
   IN  CONST UINT8 *Payload,
   IN  UINTN        PayloadLength,
   OUT UINT8       *Codewords,
-  IN  UINTN        DataCapacity
+  IN  UINTN        DataCapacity,
+  IN  UINTN        CharCountBits
   )
 {
   if ((PayloadLength > DataCapacity) || (DataCapacity == 0) ||
       (DataCapacity > COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH)) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  if ((CharCountBits != 8) && (CharCountBits != 16)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (PayloadLength >= (1ULL << CharCountBits)) {
     return EFI_BAD_BUFFER_SIZE;
   }
 
@@ -301,7 +310,7 @@ BuildDataCodewords(
     return Status;
   }
 
-  Status = BitBufferAppendBits(&Buffer, (UINT32)PayloadLength, 8);
+  Status = BitBufferAppendBits(&Buffer, (UINT32)PayloadLength, CharCountBits);
   if (EFI_ERROR(Status)) {
     return Status;
   }
@@ -1021,7 +1030,16 @@ GenerateComputerInfoQrCode(
   UINTN SelectedVersion = 0;
   for (UINTN Version = COMPUTER_INFO_QR_MIN_VERSION; Version <= COMPUTER_INFO_QR_MAX_VERSION; Version++) {
     UINTN Capacity = GetDataCodewordCapacity(Version);
-    if ((Capacity != 0) && (PayloadLength <= Capacity)) {
+    if (Capacity == 0) {
+      continue;
+    }
+
+    UINTN CharCountBits = (Version <= 9) ? 8 : 16;
+    if ((CharCountBits == 8) && (PayloadLength > 0xFF)) {
+      continue;
+    }
+
+    if (PayloadLength <= Capacity) {
       SelectedVersion = Version;
       break;
     }
@@ -1030,6 +1048,8 @@ GenerateComputerInfoQrCode(
   if (SelectedVersion == 0) {
     return EFI_BAD_BUFFER_SIZE;
   }
+
+  UINTN SelectedCharCountBits = (SelectedVersion <= 9) ? 8 : 16;
 
   UINTN Size = 4 * SelectedVersion + 17;
   UINTN DataCapacity = GetDataCodewordCapacity(SelectedVersion);
@@ -1049,7 +1069,13 @@ GenerateComputerInfoQrCode(
     goto Cleanup;
   }
 
-  Status = BuildDataCodewords(Payload, PayloadLength, DataCodewords, DataCapacity);
+  Status = BuildDataCodewords(
+             Payload,
+             PayloadLength,
+             DataCodewords,
+             DataCapacity,
+             SelectedCharCountBits
+             );
   if (EFI_ERROR(Status)) {
     goto Cleanup;
   }
