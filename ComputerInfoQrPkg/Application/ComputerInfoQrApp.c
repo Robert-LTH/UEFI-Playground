@@ -21,6 +21,10 @@
 
 #include "QrCode.h"
 
+#ifndef PCI_HEADER_TYPE_DEVICE
+#define PCI_HEADER_TYPE_DEVICE 0x00
+#endif
+
 #define QUIET_ZONE_SIZE                 2
 #define JSON_PAYLOAD_BUFFER_LENGTH      (COMPUTER_INFO_QR_MAX_PAYLOAD_LENGTH + 1)
 #define HARDWARE_MODEL_BUFFER_LENGTH    128
