@@ -1,5 +1,6 @@
 #include <Uefi.h>
 
+#include <IndustryStandard/Pci.h>
 #include <IndustryStandard/SmBios.h>
 #include <Guid/SmBios.h>
 #include <Library/BaseLib.h>
@@ -14,6 +15,7 @@
 #include <Protocol/Http.h>
 #include <Protocol/SimpleNetwork.h>
 #include <Protocol/SimpleTextIn.h>
+#include <Protocol/PciIo.h>
 #include <Protocol/ServiceBinding.h>
 #include <Protocol/Smbios.h>
 
@@ -46,6 +48,8 @@
 #define DHCP_OPTION_MAX_LENGTH              255
 #define IPV4_STRING_BUFFER_LENGTH           16
 #define SERVER_URL_MAX_LENGTH               512
+#define HARDWARE_INVENTORY_INITIAL_CAPACITY 512
+#define MAX_HARDWARE_ID_VARIANTS            9
 
 STATIC BOOLEAN mWaitForKeyPressSupported = TRUE;
 
@@ -105,6 +109,30 @@ StartDhcpClientIfStopped(
   IN     EFI_DHCP4_PROTOCOL *Dhcp4,
   IN OUT EFI_DHCP4_MODE_DATA *ModeData,
   OUT    BOOLEAN            *ClientStarted OPTIONAL
+  );
+
+STATIC
+EFI_STATUS
+BuildHardwareInventoryPayload(
+  OUT CHAR8 **JsonPayload,
+  OUT UINTN *PayloadLength
+  );
+
+STATIC
+EFI_STATUS
+SendHttpPostRequest(
+  IN EFI_HTTP_PROTOCOL *Http,
+  IN CONST CHAR16      *ServerUrl,
+  IN CONST CHAR8       *Payload,
+  IN UINTN              PayloadLength,
+  IN BOOLEAN            IncludeDhcpClientHeader,
+  IN CONST CHAR16      *PayloadDescription
+  );
+
+STATIC
+BOOLEAN
+ShouldIncludeDhcpClientHeaderForUrl(
+  IN CONST CHAR16 *ServerUrl
   );
 
 STATIC
@@ -821,6 +849,605 @@ MacAddressToString(
     AsciiSPrint(Buffer + Offset, BufferSize - Offset, "%02X", MacAddress->Addr[Index]);
     Offset += 2;
   }
+}
+
+typedef struct {
+  CHAR8 *Buffer;
+  UINTN Length;
+  UINTN Capacity;
+} JSON_STRING_BUILDER;
+
+STATIC
+EFI_STATUS
+InitializeJsonStringBuilder(
+  OUT JSON_STRING_BUILDER *Builder,
+  IN UINTN                 InitialCapacity
+  )
+{
+  if ((Builder == NULL) || (InitialCapacity == 0)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Builder->Buffer = AllocateZeroPool(InitialCapacity);
+  if (Builder->Buffer == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Builder->Length    = 0;
+  Builder->Capacity  = InitialCapacity;
+  Builder->Buffer[0] = '\0';
+  return EFI_SUCCESS;
+}
+
+STATIC
+VOID
+FreeJsonStringBuilder(
+  IN OUT JSON_STRING_BUILDER *Builder
+  )
+{
+  if (Builder == NULL) {
+    return;
+  }
+
+  if (Builder->Buffer != NULL) {
+    FreePool(Builder->Buffer);
+    Builder->Buffer = NULL;
+  }
+
+  Builder->Length   = 0;
+  Builder->Capacity = 0;
+}
+
+STATIC
+EFI_STATUS
+JsonBuilderEnsureCapacity(
+  IN OUT JSON_STRING_BUILDER *Builder,
+  IN UINTN                    AdditionalLength
+  )
+{
+  if (Builder == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (AdditionalLength == 0) {
+    return EFI_SUCCESS;
+  }
+
+  if (Builder->Buffer == NULL) {
+    return EFI_NOT_READY;
+  }
+
+  if (Builder->Capacity < Builder->Length) {
+    return EFI_BAD_BUFFER_SIZE;
+  }
+
+  UINTN Required = Builder->Length + AdditionalLength + 1;
+  if (Required <= Builder->Capacity) {
+    return EFI_SUCCESS;
+  }
+
+  UINTN NewCapacity = Builder->Capacity;
+  if (NewCapacity == 0) {
+    NewCapacity = Required;
+  }
+
+  while (NewCapacity < Required) {
+    if (NewCapacity >= MAX_UINTN / 2) {
+      NewCapacity = Required;
+      break;
+    }
+
+    NewCapacity *= 2;
+  }
+
+  if (NewCapacity < Required) {
+    NewCapacity = Required;
+  }
+
+  CHAR8 *NewBuffer = AllocateZeroPool(NewCapacity);
+  if (NewBuffer == NULL) {
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  if (Builder->Length > 0) {
+    CopyMem(NewBuffer, Builder->Buffer, Builder->Length);
+  }
+
+  FreePool(Builder->Buffer);
+  Builder->Buffer              = NewBuffer;
+  Builder->Capacity            = NewCapacity;
+  Builder->Buffer[Builder->Length] = '\0';
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+JsonBuilderAppendBuffer(
+  IN OUT JSON_STRING_BUILDER *Builder,
+  IN CONST CHAR8             *Buffer,
+  IN UINTN                    Length
+  )
+{
+  if ((Builder == NULL) || (Buffer == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (Length == 0) {
+    return EFI_SUCCESS;
+  }
+
+  EFI_STATUS Status = JsonBuilderEnsureCapacity(Builder, Length);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  CopyMem(Builder->Buffer + Builder->Length, Buffer, Length);
+  Builder->Length += Length;
+  Builder->Buffer[Builder->Length] = '\0';
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+JsonBuilderAppendString(
+  IN OUT JSON_STRING_BUILDER *Builder,
+  IN CONST CHAR8             *String
+  )
+{
+  if ((Builder == NULL) || (String == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  return JsonBuilderAppendBuffer(Builder, String, AsciiStrLen(String));
+}
+
+STATIC
+EFI_STATUS
+JsonBuilderAppendChar(
+  IN OUT JSON_STRING_BUILDER *Builder,
+  IN CHAR8                    Character
+  )
+{
+  return JsonBuilderAppendBuffer(Builder, &Character, 1);
+}
+
+STATIC
+CHAR8
+NibbleToHex(
+  IN UINT8 Value
+  )
+{
+  if (Value < 10) {
+    return (CHAR8)('0' + Value);
+  }
+
+  return (CHAR8)('A' + (Value - 10));
+}
+
+STATIC
+EFI_STATUS
+JsonBuilderAppendJsonString(
+  IN OUT JSON_STRING_BUILDER *Builder,
+  IN CONST CHAR8             *String
+  )
+{
+  if ((Builder == NULL) || (String == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  EFI_STATUS Status = JsonBuilderAppendChar(Builder, '"');
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  while (*String != '\0') {
+    CHAR8 Character = *String++;
+
+    switch (Character) {
+      case '\\':
+      case '"':
+        Status = JsonBuilderAppendChar(Builder, '\\');
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        Status = JsonBuilderAppendChar(Builder, Character);
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        break;
+
+      case '\b':
+        Status = JsonBuilderAppendString(Builder, "\\b");
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        break;
+
+      case '\f':
+        Status = JsonBuilderAppendString(Builder, "\\f");
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        break;
+
+      case '\n':
+        Status = JsonBuilderAppendString(Builder, "\\n");
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        break;
+
+      case '\r':
+        Status = JsonBuilderAppendString(Builder, "\\r");
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        break;
+
+      case '\t':
+        Status = JsonBuilderAppendString(Builder, "\\t");
+        if (EFI_ERROR(Status)) {
+          return Status;
+        }
+        break;
+
+      default:
+        if ((UINT8)Character < 0x20) {
+          CHAR8 Escape[6];
+          Escape[0] = '\\';
+          Escape[1] = 'u';
+          Escape[2] = '0';
+          Escape[3] = '0';
+          Escape[4] = NibbleToHex((Character >> 4) & 0x0F);
+          Escape[5] = NibbleToHex(Character & 0x0F);
+          Status    = JsonBuilderAppendBuffer(Builder, Escape, sizeof(Escape));
+          if (EFI_ERROR(Status)) {
+            return Status;
+          }
+        } else {
+          Status = JsonBuilderAppendChar(Builder, Character);
+          if (EFI_ERROR(Status)) {
+            return Status;
+          }
+        }
+        break;
+    }
+  }
+
+  Status = JsonBuilderAppendChar(Builder, '"');
+  return Status;
+}
+
+STATIC
+UINTN
+GenerateHardwareIdVariants(
+  IN CONST PCI_TYPE00 *Config,
+  OUT CHAR8            Variants[][64],
+  IN UINTN             MaxVariants
+  )
+{
+  if ((Config == NULL) || (Variants == NULL) || (MaxVariants == 0)) {
+    return 0;
+  }
+
+  UINT16 VendorId = Config->Hdr.VendorId;
+  if (VendorId == 0xFFFF) {
+    return 0;
+  }
+
+  UINT16 DeviceId   = Config->Hdr.DeviceId;
+  UINT8  Revision   = Config->Hdr.RevisionID;
+  UINT8  BaseClass  = Config->Hdr.ClassCode[2];
+  UINT8  SubClass   = Config->Hdr.ClassCode[1];
+  UINT8  ProgIf     = Config->Hdr.ClassCode[0];
+  UINTN  Count      = 0;
+
+  BOOLEAN HasSubsystem = FALSE;
+  UINT16  SubVendor    = 0;
+  UINT16  SubDevice    = 0;
+
+  UINT8 HeaderType = Config->Hdr.HeaderType & 0x7F;
+  if (HeaderType == PCI_HEADER_TYPE_DEVICE) {
+    SubVendor = Config->Device.SubsystemVendorID;
+    SubDevice = Config->Device.SubsystemID;
+    if ((SubVendor != 0) && (SubVendor != 0xFFFF) &&
+        (SubDevice != 0) && (SubDevice != 0xFFFF)) {
+      HasSubsystem = TRUE;
+    }
+  }
+
+  if (HasSubsystem) {
+    if (Count < MaxVariants) {
+      AsciiSPrint(
+        Variants[Count],
+        sizeof(Variants[Count]),
+        "PCI\\VEN_%04X&DEV_%04X&SUBSYS_%04X%04X&REV_%02X",
+        VendorId,
+        DeviceId,
+        SubVendor,
+        SubDevice,
+        Revision
+        );
+      Count++;
+    }
+
+    if (Count < MaxVariants) {
+      AsciiSPrint(
+        Variants[Count],
+        sizeof(Variants[Count]),
+        "PCI\\VEN_%04X&DEV_%04X&SUBSYS_%04X%04X",
+        VendorId,
+        DeviceId,
+        SubVendor,
+        SubDevice
+        );
+      Count++;
+    }
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\VEN_%04X&DEV_%04X&REV_%02X",
+      VendorId,
+      DeviceId,
+      Revision
+      );
+    Count++;
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\VEN_%04X&DEV_%04X",
+      VendorId,
+      DeviceId
+      );
+    Count++;
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\VEN_%04X&CC_%02X%02X%02X",
+      VendorId,
+      BaseClass,
+      SubClass,
+      ProgIf
+      );
+    Count++;
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\VEN_%04X&CC_%02X%02X",
+      VendorId,
+      BaseClass,
+      SubClass
+      );
+    Count++;
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\VEN_%04X",
+      VendorId
+      );
+    Count++;
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\CC_%02X%02X%02X",
+      BaseClass,
+      SubClass,
+      ProgIf
+      );
+    Count++;
+  }
+
+  if (Count < MaxVariants) {
+    AsciiSPrint(
+      Variants[Count],
+      sizeof(Variants[Count]),
+      "PCI\\CC_%02X%02X",
+      BaseClass,
+      SubClass
+      );
+    Count++;
+  }
+
+  return Count;
+}
+
+STATIC
+EFI_STATUS
+BuildHardwareInventoryPayload(
+  OUT CHAR8 **JsonPayload,
+  OUT UINTN *PayloadLength
+  )
+{
+  if ((JsonPayload == NULL) || (PayloadLength == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *JsonPayload   = NULL;
+  *PayloadLength = 0;
+
+  if (gBS == NULL) {
+    return EFI_NOT_READY;
+  }
+
+  EFI_STATUS Status;
+  EFI_HANDLE *HandleBuffer = NULL;
+  UINTN       HandleCount  = 0;
+
+  Status = gBS->LocateHandleBuffer(
+                  ByProtocol,
+                  &gEfiPciIoProtocolGuid,
+                  NULL,
+                  &HandleCount,
+                  &HandleBuffer
+                  );
+  if (EFI_ERROR(Status)) {
+    if (Status != EFI_NOT_FOUND) {
+      return Status;
+    }
+
+    HandleCount  = 0;
+    HandleBuffer = NULL;
+  }
+
+  JSON_STRING_BUILDER Builder;
+  ZeroMem(&Builder, sizeof(Builder));
+
+  Status = InitializeJsonStringBuilder(&Builder, HARDWARE_INVENTORY_INITIAL_CAPACITY);
+  if (EFI_ERROR(Status)) {
+    if (HandleBuffer != NULL) {
+      FreePool(HandleBuffer);
+    }
+    return Status;
+  }
+
+  Status = JsonBuilderAppendString(&Builder, "{\"devices\":[");
+  if (EFI_ERROR(Status)) {
+    goto Cleanup;
+  }
+
+  BOOLEAN FirstDevice = TRUE;
+
+  for (UINTN Index = 0; Index < HandleCount; Index++) {
+    EFI_PCI_IO_PROTOCOL *PciIo = NULL;
+    Status = gBS->HandleProtocol(HandleBuffer[Index], &gEfiPciIoProtocolGuid, (VOID **)&PciIo);
+    if (EFI_ERROR(Status) || (PciIo == NULL)) {
+      continue;
+    }
+
+    PCI_TYPE00 PciHeader;
+    ZeroMem(&PciHeader, sizeof(PciHeader));
+
+    Status = PciIo->Pci.Read(
+                         PciIo,
+                         EfiPciIoWidthUint32,
+                         0,
+                         sizeof(PciHeader) / sizeof(UINT32),
+                         &PciHeader
+                         );
+    if (EFI_ERROR(Status)) {
+      continue;
+    }
+
+    CHAR8 HardwareIds[MAX_HARDWARE_ID_VARIANTS][64];
+    UINTN VariantCount = GenerateHardwareIdVariants(&PciHeader, HardwareIds, MAX_HARDWARE_ID_VARIANTS);
+    if (VariantCount == 0) {
+      continue;
+    }
+
+    UINTN Segment  = 0;
+    UINTN Bus      = 0;
+    UINTN Device   = 0;
+    UINTN Function = 0;
+
+    if (PciIo->GetLocation != NULL) {
+      EFI_STATUS LocationStatus = PciIo->GetLocation(PciIo, &Segment, &Bus, &Device, &Function);
+      if (EFI_ERROR(LocationStatus)) {
+        Segment  = 0;
+        Bus      = 0;
+        Device   = 0;
+        Function = 0;
+      }
+    }
+
+    CHAR8 Location[32];
+    AsciiSPrint(
+      Location,
+      sizeof(Location),
+      "%04X:%02X:%02X.%u",
+      (UINT32)Segment,
+      (UINT32)Bus,
+      (UINT32)Device,
+      (UINT32)Function
+      );
+
+    if (!FirstDevice) {
+      Status = JsonBuilderAppendChar(&Builder, ',');
+      if (EFI_ERROR(Status)) {
+        goto Cleanup;
+      }
+    }
+
+    FirstDevice = FALSE;
+
+    Status = JsonBuilderAppendString(&Builder, "{\"location\":");
+    if (EFI_ERROR(Status)) {
+      goto Cleanup;
+    }
+
+    Status = JsonBuilderAppendJsonString(&Builder, Location);
+    if (EFI_ERROR(Status)) {
+      goto Cleanup;
+    }
+
+    Status = JsonBuilderAppendString(&Builder, ",\"hardware_ids\":[");
+    if (EFI_ERROR(Status)) {
+      goto Cleanup;
+    }
+
+    for (UINTN VariantIndex = 0; VariantIndex < VariantCount; VariantIndex++) {
+      if (VariantIndex != 0) {
+        Status = JsonBuilderAppendChar(&Builder, ',');
+        if (EFI_ERROR(Status)) {
+          goto Cleanup;
+        }
+      }
+
+      Status = JsonBuilderAppendJsonString(&Builder, HardwareIds[VariantIndex]);
+      if (EFI_ERROR(Status)) {
+        goto Cleanup;
+      }
+    }
+
+    Status = JsonBuilderAppendString(&Builder, "]}");
+    if (EFI_ERROR(Status)) {
+      goto Cleanup;
+    }
+  }
+
+  Status = JsonBuilderAppendString(&Builder, "]}");
+  if (EFI_ERROR(Status)) {
+    goto Cleanup;
+  }
+
+  *JsonPayload   = Builder.Buffer;
+  *PayloadLength = Builder.Length;
+
+  Builder.Buffer   = NULL;
+  Builder.Length   = 0;
+  Builder.Capacity = 0;
+
+  Status = EFI_SUCCESS;
+
+Cleanup:
+  if (HandleBuffer != NULL) {
+    FreePool(HandleBuffer);
+  }
+
+  if (Builder.Buffer != NULL) {
+    FreeJsonStringBuilder(&Builder);
+  }
+
+  return Status;
 }
 
 STATIC
@@ -2136,6 +2763,208 @@ PromptForServerUrl(
 }
 
 STATIC
+BOOLEAN
+ShouldIncludeDhcpClientHeaderForUrl(
+  IN CONST CHAR16 *ServerUrl
+  )
+{
+  if ((ServerUrl == NULL) || (ServerUrl[0] == L'\0')) {
+    return FALSE;
+  }
+
+  CONST CHAR16 *HostStart = ServerUrl;
+  CONST CHAR16 *SchemeSeparator = StrStr(ServerUrl, L"://");
+  if (SchemeSeparator != NULL) {
+    HostStart = SchemeSeparator + 3;
+  }
+
+  while (*HostStart == L'/') {
+    HostStart++;
+  }
+
+  if (*HostStart == L'\0') {
+    return FALSE;
+  }
+
+  CONST CHAR16 *HostEnd = HostStart;
+  while ((*HostEnd != L'\0') && (*HostEnd != L'/') && (*HostEnd != L':')) {
+    HostEnd++;
+  }
+
+  UINTN HostLength = (UINTN)(HostEnd - HostStart);
+  if (HostLength == 0) {
+    return FALSE;
+  }
+
+  CONST CHAR16 Target[]      = L"qr-reporter";
+  CONST UINTN TargetLength   = ARRAY_SIZE(Target) - 1;
+
+  if (HostLength < TargetLength) {
+    return FALSE;
+  }
+
+  for (UINTN Index = 0; Index < TargetLength; Index++) {
+    CHAR16 Current = HostStart[Index];
+    if ((Current >= L'A') && (Current <= L'Z')) {
+      Current = (CHAR16)(Current - L'A' + L'a');
+    }
+
+    if (Current != Target[Index]) {
+      return FALSE;
+    }
+  }
+
+  if (HostLength == TargetLength) {
+    return TRUE;
+  }
+
+  CHAR16 NextCharacter = HostStart[TargetLength];
+  if (NextCharacter == L'.') {
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+STATIC
+EFI_STATUS
+SendHttpPostRequest(
+  IN EFI_HTTP_PROTOCOL *Http,
+  IN CONST CHAR16      *ServerUrl,
+  IN CONST CHAR8       *Payload,
+  IN UINTN              PayloadLength,
+  IN BOOLEAN            IncludeDhcpClientHeader,
+  IN CONST CHAR16      *PayloadDescription
+  )
+{
+  if ((Http == NULL) || (ServerUrl == NULL) || (Payload == NULL) ||
+      (PayloadLength == 0) || (PayloadDescription == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  CHAR8 ContentTypeName[]   = "Content-Type";
+  CHAR8 ContentTypeValue[]  = "application/json";
+  CHAR8 ContentLengthName[] = "Content-Length";
+  CHAR8 ContentLengthValue[32];
+  AsciiSPrint(ContentLengthValue, sizeof(ContentLengthValue), "%Lu", (UINT64)PayloadLength);
+
+  CHAR8 DhcpClientName[]  = "dhcp-client";
+  CHAR8 DhcpClientValue[] = "1";
+
+  EFI_HTTP_HEADER RequestHeaders[3];
+  UINTN           HeaderCount = 0;
+
+  RequestHeaders[HeaderCount].FieldName  = ContentTypeName;
+  RequestHeaders[HeaderCount].FieldValue = ContentTypeValue;
+  HeaderCount++;
+
+  RequestHeaders[HeaderCount].FieldName  = ContentLengthName;
+  RequestHeaders[HeaderCount].FieldValue = ContentLengthValue;
+  HeaderCount++;
+
+  if (IncludeDhcpClientHeader) {
+    RequestHeaders[HeaderCount].FieldName  = DhcpClientName;
+    RequestHeaders[HeaderCount].FieldValue = DhcpClientValue;
+    HeaderCount++;
+  }
+
+  EFI_HTTP_REQUEST_DATA RequestData;
+  ZeroMem(&RequestData, sizeof(RequestData));
+  RequestData.Method = HttpMethodPost;
+  RequestData.Url    = (CHAR16 *)ServerUrl;
+
+  EFI_HTTP_MESSAGE RequestMessage;
+  ZeroMem(&RequestMessage, sizeof(RequestMessage));
+  RequestMessage.Data.Request = &RequestData;
+  RequestMessage.HeaderCount  = HeaderCount;
+  RequestMessage.Headers      = RequestHeaders;
+  RequestMessage.BodyLength   = PayloadLength;
+  RequestMessage.Body         = (VOID *)Payload;
+
+  EFI_HTTP_TOKEN RequestToken;
+  ZeroMem(&RequestToken, sizeof(RequestToken));
+  RequestToken.Message = &RequestMessage;
+
+  EFI_STATUS Status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, NULL, NULL, &RequestToken.Event);
+  if (EFI_ERROR(Status)) {
+    return Status;
+  }
+
+  Status = Http->Request(Http, &RequestToken);
+  if (!EFI_ERROR(Status)) {
+    UINTN EventIndex;
+    Status = gBS->WaitForEvent(1, &RequestToken.Event, &EventIndex);
+    if (!EFI_ERROR(Status)) {
+      Status = RequestToken.Status;
+    }
+  }
+
+  gBS->CloseEvent(RequestToken.Event);
+  RequestToken.Event = NULL;
+
+  if (EFI_ERROR(Status)) {
+    Print(L"HTTP request for %s failed: %r\n", PayloadDescription, Status);
+    return Status;
+  }
+
+  EFI_HTTP_RESPONSE_DATA ResponseData;
+  EFI_HTTP_MESSAGE      ResponseMessage;
+  EFI_HTTP_TOKEN        ResponseToken;
+
+  ZeroMem(&ResponseData, sizeof(ResponseData));
+  ZeroMem(&ResponseMessage, sizeof(ResponseMessage));
+  ZeroMem(&ResponseToken, sizeof(ResponseToken));
+
+  ResponseMessage.Data.Response = &ResponseData;
+  ResponseToken.Message         = &ResponseMessage;
+
+  EFI_STATUS ResponseStatus = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, NULL, NULL, &ResponseToken.Event);
+  if (EFI_ERROR(ResponseStatus)) {
+    return ResponseStatus;
+  }
+
+  ResponseStatus = Http->Response(Http, &ResponseToken);
+  if (!EFI_ERROR(ResponseStatus)) {
+    UINTN EventIndex;
+    ResponseStatus = gBS->WaitForEvent(1, &ResponseToken.Event, &EventIndex);
+    if (!EFI_ERROR(ResponseStatus)) {
+      ResponseStatus = ResponseToken.Status;
+    }
+  }
+
+  gBS->CloseEvent(ResponseToken.Event);
+  ResponseToken.Event = NULL;
+
+  Status = ResponseStatus;
+
+  if (EFI_ERROR(Status) && (Status != EFI_HTTP_ERROR)) {
+    Print(L"HTTP response for %s failed: %r\n", PayloadDescription, Status);
+    FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
+    return Status;
+  }
+
+  EFI_HTTP_STATUS_CODE HttpStatus = ResponseData.StatusCode;
+
+  if (Status == EFI_HTTP_ERROR) {
+    Print(L"Server returned HTTP error %u for %s\n", (UINT32)HttpStatus, PayloadDescription);
+    FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
+    return EFI_PROTOCOL_ERROR;
+  }
+
+  Print(L"Server returned HTTP status %u for %s\n", (UINT32)HttpStatus, PayloadDescription);
+
+  EFI_STATUS FinalStatus;
+  if ((HttpStatus >= HTTP_STATUS_200_OK) && (HttpStatus < HTTP_STATUS_300_MULTIPLE_CHOICES)) {
+    FinalStatus = EFI_SUCCESS;
+  } else {
+    FinalStatus = EFI_PROTOCOL_ERROR;
+  }
+
+  FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
+  return FinalStatus;
+}
+
+STATIC
 EFI_STATUS
 PostSystemInfoToServer(
   IN CONST CHAR8 *JsonPayload,
@@ -2183,6 +3012,18 @@ PostSystemInfoToServer(
 
   Print(L"Using server URL: %s\n", ServerUrl);
 
+  BOOLEAN IncludeDhcpHeader = ShouldIncludeDhcpClientHeaderForUrl(ServerUrl);
+
+  CHAR8 *HardwarePayload       = NULL;
+  UINTN  HardwarePayloadLength = 0;
+
+  Status = BuildHardwareInventoryPayload(&HardwarePayload, &HardwarePayloadLength);
+  if (EFI_ERROR(Status)) {
+    Print(L"Unable to build hardware inventory payload: %r\n", Status);
+    FreePool(ServerUrl);
+    return Status;
+  }
+
   EFI_HANDLE *HandleBuffer = NULL;
   UINTN       HandleCount  = 0;
 
@@ -2200,6 +3041,9 @@ PostSystemInfoToServer(
     Print(L"Unable to locate HTTP service binding: %r\n", Status);
     if (HandleBuffer != NULL) {
       FreePool(HandleBuffer);
+    }
+    if (HardwarePayload != NULL) {
+      FreePool(HardwarePayload);
     }
     FreePool(ServerUrl);
     return Status;
@@ -2253,111 +3097,36 @@ PostSystemInfoToServer(
     }
     HttpConfigured = TRUE;
 
-    CHAR8 ContentTypeName[]   = "Content-Type";
-    CHAR8 ContentTypeValue[]  = "application/json";
-    CHAR8 ContentLengthName[] = "Content-Length";
-    CHAR8 ContentLengthValue[32];
-    AsciiSPrint(ContentLengthValue, sizeof(ContentLengthValue), "%Lu", (UINT64)PayloadLength);
-
-    EFI_HTTP_HEADER RequestHeaders[2];
-    RequestHeaders[0].FieldName  = ContentTypeName;
-    RequestHeaders[0].FieldValue = ContentTypeValue;
-    RequestHeaders[1].FieldName  = ContentLengthName;
-    RequestHeaders[1].FieldValue = ContentLengthValue;
-
-    EFI_HTTP_REQUEST_DATA RequestData;
-    ZeroMem(&RequestData, sizeof(RequestData));
-    RequestData.Method = HttpMethodPost;
-    RequestData.Url    = ServerUrl;
-
-    EFI_HTTP_MESSAGE RequestMessage;
-    ZeroMem(&RequestMessage, sizeof(RequestMessage));
-    RequestMessage.Data.Request = &RequestData;
-    RequestMessage.HeaderCount  = ARRAY_SIZE(RequestHeaders);
-    RequestMessage.Headers      = RequestHeaders;
-    RequestMessage.BodyLength   = PayloadLength;
-    RequestMessage.Body         = (VOID *)JsonPayload;
-
-    EFI_HTTP_TOKEN RequestToken;
-    ZeroMem(&RequestToken, sizeof(RequestToken));
-    RequestToken.Message = &RequestMessage;
-
-    Status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, NULL, NULL, &RequestToken.Event);
+    Status = SendHttpPostRequest(
+               Http,
+               ServerUrl,
+               JsonPayload,
+               PayloadLength,
+               IncludeDhcpHeader,
+               L"system information payload"
+               );
     if (EFI_ERROR(Status)) {
       Result = Status;
       goto NextHandle;
     }
 
-    Status = Http->Request(Http, &RequestToken);
-    if (!EFI_ERROR(Status)) {
-      UINTN EventIndex;
-      Status = gBS->WaitForEvent(1, &RequestToken.Event, &EventIndex);
-      if (!EFI_ERROR(Status)) {
-        Status = RequestToken.Status;
+    if ((HardwarePayload != NULL) && (HardwarePayloadLength > 0)) {
+      Status = SendHttpPostRequest(
+                 Http,
+                 ServerUrl,
+                 HardwarePayload,
+                 HardwarePayloadLength,
+                 IncludeDhcpHeader,
+                 L"hardware inventory payload"
+                 );
+      if (EFI_ERROR(Status)) {
+        Result = Status;
+        goto NextHandle;
       }
     }
 
-    gBS->CloseEvent(RequestToken.Event);
-    RequestToken.Event = NULL;
-
-    if (EFI_ERROR(Status)) {
-      Print(L"HTTP request failed: %r\n", Status);
-      Result = Status;
-      goto NextHandle;
-    }
-
-    EFI_HTTP_RESPONSE_DATA ResponseData;
-    EFI_HTTP_MESSAGE      ResponseMessage;
-    EFI_HTTP_TOKEN        ResponseToken;
-
-    ZeroMem(&ResponseData, sizeof(ResponseData));
-    ZeroMem(&ResponseMessage, sizeof(ResponseMessage));
-    ZeroMem(&ResponseToken, sizeof(ResponseToken));
-
-    ResponseMessage.Data.Response = &ResponseData;
-    ResponseToken.Message         = &ResponseMessage;
-
-    Status = gBS->CreateEvent(EVT_NOTIFY_SIGNAL, TPL_CALLBACK, NULL, NULL, &ResponseToken.Event);
-    if (EFI_ERROR(Status)) {
-      Result = Status;
-      goto NextHandle;
-    }
-
-    Status = Http->Response(Http, &ResponseToken);
-    if (!EFI_ERROR(Status)) {
-      UINTN EventIndex;
-      Status = gBS->WaitForEvent(1, &ResponseToken.Event, &EventIndex);
-      if (!EFI_ERROR(Status)) {
-        Status = ResponseToken.Status;
-      }
-    }
-
-    gBS->CloseEvent(ResponseToken.Event);
-    ResponseToken.Event = NULL;
-
-    if (EFI_ERROR(Status) && (Status != EFI_HTTP_ERROR)) {
-      Print(L"HTTP response failed: %r\n", Status);
-      FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
-      Result = Status;
-      goto NextHandle;
-    }
-
-    if (Status == EFI_HTTP_ERROR) {
-      Print(L"Server returned HTTP error %u\n", (UINT32)ResponseData.StatusCode);
-      Result    = EFI_PROTOCOL_ERROR;
-      Completed = TRUE;
-    } else {
-      Print(L"Server returned HTTP status %u\n", (UINT32)ResponseData.StatusCode);
-      if ((ResponseData.StatusCode >= HTTP_STATUS_200_OK) &&
-          (ResponseData.StatusCode < HTTP_STATUS_300_MULTIPLE_CHOICES)) {
-        Result    = EFI_SUCCESS;
-      } else {
-        Result    = EFI_PROTOCOL_ERROR;
-      }
-      Completed = TRUE;
-    }
-
-    FreeHttpHeaders(ResponseMessage.Headers, ResponseMessage.HeaderCount);
+    Result    = EFI_SUCCESS;
+    Completed = TRUE;
 
 NextHandle:
     if (HttpConfigured && (Http != NULL)) {
@@ -2379,6 +3148,10 @@ NextHandle:
 
   if (HandleBuffer != NULL) {
     FreePool(HandleBuffer);
+  }
+
+  if (HardwarePayload != NULL) {
+    FreePool(HardwarePayload);
   }
 
   FreePool(ServerUrl);
